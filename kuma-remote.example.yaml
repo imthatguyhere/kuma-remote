@@ -1,4 +1,5 @@
 debug: false # optional, defaults to false
+report_run_failures: true # optional, defaults to true
 
 checks:
   - id: web01
