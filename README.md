@@ -26,7 +26,7 @@ The compiled binary is written to `target/release/kuma-remote` (`kuma-remote.exe
 
 ## Configuration
 
-Checks are defined in a [StrictYAML](https://hitchdev.com/strictyaml/) file. By default `kuma-remote` looks for `kuma-remote.yaml` in the current directory; use `--config` to point elsewhere. See `kuma-remote.example.yaml` for a working example.
+Checks are defined in a [StrictYAML](https://hitchdev.com/strictyaml/) file. If `--config` is not given, `kuma-remote` looks in the current directory for `kuma-remote.yaml`, then `kuma-config.yaml`, then `config.yaml`, using the first one that exists. See `kuma-remote.example.yaml` for a working example.
 
 ```yaml
 debug: false # optional, defaults to false
@@ -75,7 +75,7 @@ The config file must define at least one check; a zero-length `interval` or a du
 kuma-remote [--config <path>]
 ```
 
-- `-c`, `--config <path>` -- Path to the StrictYAML config file. Default: `kuma-remote.yaml`.
+- `-c`, `--config <path>` -- Path to the StrictYAML config file. Default: first of `kuma-remote.yaml`, `kuma-config.yaml`, `config.yaml` (checked in that order) that exists.
 - `-h`, `--help` -- Print help.
 - `-V`, `--version` -- Print version.
 

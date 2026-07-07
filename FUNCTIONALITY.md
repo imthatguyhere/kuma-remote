@@ -4,7 +4,7 @@
 
 ## Data Flow
 
-1. `main.rs` parses CLI args, then calls `config::Config::load` with the `--config` path.
+1. `main.rs` parses CLI args, resolves the config path via `resolve_config_path` (the explicit `--config` value, or else the first of `kuma-remote.yaml`/`kuma-config.yaml`/`config.yaml` that exists), then calls `config::Config::load` with it.
 2. `config::Config::load` reads the file, deserializes it as StrictYAML into `Config`, normalizes it, and validates it (non-empty, unique `id`s, non-zero `interval`s).
 3. If `config.debug` is set, `main.rs` logs every configured check before starting.
 4. `main.rs` builds a single shared `reqwest::Client` and calls `scheduler::spawn_all` (passing `config.debug` and `config.report_run_failures` through), which spawns one tokio task per `CheckConfig`.
@@ -14,7 +14,7 @@
 
 ## Configuration
 
-Single StrictYAML file (default path `kuma-remote.yaml`, overridable via `--config`). Schema: a top-level `checks` sequence of mappings, each deserialized into `config::CheckConfig`. `interval` is parsed via `humantime_serde` from strings like `"30s"`/`"5m"`/`"1h"`. Deserialization uses `strict_yaml_rust::serde::from_str`.
+Single StrictYAML file. Path is set via `--config`, or else resolved by `main::resolve_config_path` to the first existing file among `kuma-remote.yaml`, `kuma-config.yaml`, `config.yaml` (falling back to `kuma-remote.yaml` if none exist, so the load error names a sensible file). Schema: a top-level `checks` sequence of mappings, each deserialized into `config::CheckConfig`. `interval` is parsed via `humantime_serde` from strings like `"30s"`/`"5m"`/`"1h"`. Deserialization uses `strict_yaml_rust::serde::from_str`.
 
 The only other configuration source is the `RUST_LOG` environment variable, read by `logging::init` via `tracing_subscriber::EnvFilter`.
 
@@ -28,11 +28,16 @@ Purpose: process entry point -- CLI parsing, config load, task orchestration, sh
 
 Types:
 
-- `Cli` -- `clap::Parser` struct; single field `config: PathBuf` (`-c`/`--config`, default `kuma-remote.yaml`).
+- `Cli` -- `clap::Parser` struct; single field `config: Option<PathBuf>` (`-c`/`--config`, no default -- absence triggers the `DEFAULT_CONFIG_CANDIDATES` lookup).
+
+Constants:
+
+- `DEFAULT_CONFIG_CANDIDATES: [&str; 3]` -- `["kuma-remote.yaml", "kuma-config.yaml", "config.yaml"]`, tried in order when `--config` is not given.
 
 Functions:
 
-- `main() -> anyhow::Result<()>` (async, `#[tokio::main]`) -- initializes logging, parses CLI args, loads config, logs every check when `config.debug` is set, builds the shared `reqwest::Client` (with a desktop-Chrome `User-Agent` override -- see below), spawns the scheduler with `config.debug` and `config.report_run_failures`, waits on `tokio::signal::ctrl_c()`, then aborts all check task handles before returning.
+- `resolve_config_path(explicit: Option<PathBuf>) -> PathBuf` -- returns `explicit` if given; otherwise returns the first of `DEFAULT_CONFIG_CANDIDATES` that exists on disk, or the first candidate (`kuma-remote.yaml`) if none exist.
+- `main() -> anyhow::Result<()>` (async, `#[tokio::main]`) -- initializes logging, parses CLI args, resolves the config path via `resolve_config_path`, loads config, logs every check when `config.debug` is set, builds the shared `reqwest::Client` (with a desktop-Chrome `User-Agent` override -- see below), spawns the scheduler with `config.debug` and `config.report_run_failures`, waits on `tokio::signal::ctrl_c()`, then aborts all check task handles before returning.
 
 Key detail: the `reqwest::Client` is built with `.user_agent(...)` set to a real desktop Chrome-on-Windows string instead of reqwest's default `reqwest/x.y.z`. Some reverse proxies / WAFs (e.g. Cloudflare bot protection) block generic HTTP-client user agents while allowing browsers, which otherwise manifests as push requests failing (404/403) even though the same URL works from a browser.
 
