@@ -3,7 +3,7 @@ name = "kuma-remote"
 
 description = "Uptime Kuma push monitor client"
 authors = ["Imthatguyhere (ITGH | Tyler)"]
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 
 [dependencies]
