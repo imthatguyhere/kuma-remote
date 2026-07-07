@@ -17,7 +17,20 @@ pub struct Config {
     /// unless explicitly requested.
     #[serde(default)]
     pub debug: bool,
+    /// When true, a check run that errors out (as opposed to completing and
+    /// reporting `Down`, e.g. an unresolvable hostname) is also pushed to
+    /// Kuma as a `down` status with the error as `msg`, instead of only
+    /// being logged. On by default: without this, a run error sends no
+    /// heartbeat at all, which leaves the Kuma monitor stuck showing its
+    /// last known state (or pending) instead of reflecting the failure.
+    #[serde(default = "default_report_run_failures")]
+    pub report_run_failures: bool,
     pub checks: Vec<CheckConfig>,
+}
+
+/// Default value for [`Config::report_run_failures`] when absent from the config file.
+fn default_report_run_failures() -> bool {
+    true
 }
 
 /// One monitored target and where to report its result.
