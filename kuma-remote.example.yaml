@@ -1,0 +1,16 @@
+debug: false # optional, defaults to false
+
+checks:
+  - id: web01
+    name: "Prod Web Server"
+    mode: ping
+    host: 192.168.1.10
+    push_url: "https://kuma.mydomain.com/api/push/AbC123XyZ"
+    interval: 60s
+
+  - id: db01
+    name: "Database Host"
+    mode: ping
+    host: db.internal.local
+    push_url: "https://kuma.mydomain.com/api/push/QwErTy987"
+    interval: 5m
