@@ -1,5 +1,5 @@
-debug: false # optional, defaults to false
-report_run_failures: true # optional, defaults to true
+debug: false #=-- optional, defaults to false
+report_run_failures: true #=-- optional, defaults to true
 
 checks:
   - id: web01
@@ -7,7 +7,7 @@ checks:
     mode: ping
     host: 192.168.1.10
     push_url: "https://kuma.mydomain.com/api/push/AbC123XyZ"
-    interval: 60s
+    interval: 60s #=-- It's recommended to set the heartbeat interval to at least 30 seconds longer than the longest expected check interval.
 
   - id: db01
     name: "Database Host"
