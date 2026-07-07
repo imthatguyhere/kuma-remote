@@ -63,7 +63,12 @@ async fn main() -> Result<()> {
         )
         .build()
         .context("Building HTTP client")?;
-    let handles = scheduler::spawn_all(config.checks, client, config.debug);
+    let handles = scheduler::spawn_all(
+        config.checks,
+        client,
+        config.debug,
+        config.report_run_failures,
+    );
 
     tokio::signal::ctrl_c()
         .await
