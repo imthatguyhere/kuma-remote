@@ -30,6 +30,7 @@ Checks are defined in a [StrictYAML](https://hitchdev.com/strictyaml/) file. By 
 
 ```yaml
 debug: false # optional, defaults to false
+report_run_failures: true # optional, defaults to true
 
 checks:
   - id: web01
@@ -50,6 +51,7 @@ checks:
 Top-level fields:
 
 - `debug` -- optional, defaults to `false`. When `true`, every configured check is logged at startup, and every push logs the exact request URL sent to Kuma, including its query string. Leave this off unless you're actively troubleshooting: a push URL is itself a bearer credential (anyone who has it can push status to your monitor), so `kuma-remote` doesn't log it by default.
+- `report_run_failures` -- optional, defaults to `true`. When `true`, a check run that errors out entirely (e.g. an unresolvable hostname) is also pushed to Kuma as a `down` status with the error as `msg`, in addition to being logged. On by default: without it, a run error sends no heartbeat at all, leaving the Kuma monitor stuck on its last known state instead of reflecting the failure. Set to `false` to only log run errors and never push for them.
 - `checks` -- the list of checks to run, described below.
 
 Fields, per entry under `checks` (all required):
