@@ -30,8 +30,8 @@ Required `FUNCTIONALITY.md` structure:
 - Data Flow
 - Configuration
 - Build and release packaging when non-default build behavior exists
-- One H2 section for each source module: `main.rs`, `installed.rs`, `cdk_info.rs`, and `app_logging.rs`
-- For each module: purpose, types, constants when applicable, public/exported functions, key internal functions when they explain behavior, and key algorithms
-- Target software table showing `installed_name`, `osd_description`, and detection function
+- One H2 section for each source module.
+  - For each module: purpose, types, constants when applicable, public/exported functions, key internal functions when they explain behavior, and key algorithms
+- Checks table.
 
 When editing Rust source, include documentation updates in the same change. If no documentation update is needed, note why in the final response or change notes.
