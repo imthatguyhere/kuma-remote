@@ -12,17 +12,39 @@ use crate::kuma::{self, PushStatus};
 
 /// Spawn one background task per check; returns their join handles so the
 /// caller can abort them on shutdown. `debug` enables logging the exact
-/// pushed URL (including query string) on every push.
-pub fn spawn_all(checks: Vec<CheckConfig>, client: Client, debug: bool) -> Vec<JoinHandle<()>> {
+/// pushed URL (including query string) on every push. `report_run_failures`
+/// controls whether a run error (as opposed to a completed `Down` result)
+/// is also pushed to Kuma as `down`, per [`crate::config::Config::report_run_failures`].
+pub fn spawn_all(
+    checks: Vec<CheckConfig>,
+    client: Client,
+    debug: bool,
+    report_run_failures: bool,
+) -> Vec<JoinHandle<()>> {
     checks
         .into_iter()
-        .map(|check| tokio::spawn(run_check_loop(check, client.clone(), debug)))
+        .map(|check| {
+            tokio::spawn(run_check_loop(
+                check,
+                client.clone(),
+                debug,
+                report_run_failures,
+            ))
+        })
         .collect()
 }
 
 /// Tick `check`'s interval forever, running and pushing one result per
-/// tick. Logs and swallows errors so one bad run doesn't kill the loop.
-async fn run_check_loop(check: CheckConfig, client: Client, debug: bool) {
+/// tick. On a run error, logs it and, when `report_run_failures` is set,
+/// also pushes it to Kuma as a `down` status so the failure is visible
+/// there too. Swallows errors either way so one bad run doesn't kill the
+/// loop.
+async fn run_check_loop(
+    check: CheckConfig,
+    client: Client,
+    debug: bool,
+    report_run_failures: bool,
+) {
     let mut ticker = interval(check.interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
@@ -30,6 +52,14 @@ async fn run_check_loop(check: CheckConfig, client: Client, debug: bool) {
         ticker.tick().await;
         if let Err(err) = run_once(&check, &client, debug).await {
             error!(check_id = %check.id, error = %err, "Check run failed");
+            if report_run_failures {
+                let status = PushStatus::Down {
+                    message: format!("Check run failed: {err}"),
+                };
+                if let Err(push_err) = kuma::push(&client, &check.push_url, status, debug).await {
+                    error!(check_id = %check.id, error = %push_err, "Failed to push run-failure status");
+                }
+            }
         }
     }
 }
