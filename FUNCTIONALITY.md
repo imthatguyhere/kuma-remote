@@ -108,7 +108,7 @@ Types:
 
 Public functions:
 
-- `beat_once(host: Option<String>) -> HeartbeatOutcome` (async) -- when `host` is `Some`, calls `ping::ping_once` and keeps the latency only on `PingOutcome::Up`; `PingOutcome::Down` and a propagated `ping_once` error are both treated as "no latency available", not as a failed heartbeat. When `host` is `None`, returns `latency_ms: None` directly without pinging.
+- `beat_once(host: Option<String>) -> HeartbeatOutcome` (async) -- when `host` is `Some`, calls `ping::ping_once` and keeps the latency only on `PingOutcome::Up`; `PingOutcome::Down` and a propagated `ping_once` error are both treated as "no latency available", not as a failed heartbeat, and are logged via `tracing::warn!` (with the host and reason/error) so a misconfigured or unreachable diagnostic host is still visible in logs. When `host` is `None`, returns `latency_ms: None` directly without pinging.
 
 Key algorithm: unlike `checks/ping.rs`, this check's `host` is diagnostic, not load-bearing -- its purpose is proving the `kuma-remote` process is running, so a failed ping only drops the latency figure and never turns the heartbeat down.
 
@@ -126,7 +126,7 @@ Constants:
 
 Public functions:
 
-- `push(client: &Client, push_url: &str, status: PushStatus, debug: bool) -> anyhow::Result<()>` (async) -- parses `push_url` into a `reqwest::Url`, appends `status`/`msg` (`msg` defaults to `"OK"` for `PushStatus::Up` when its `message` is `None`) and `ping` when known as query pairs, logs the final URL when `debug` is set, sends the GET request, and errors on a non-2xx response.
+- `push(client: &Client, push_url: &str, status: PushStatus, debug: bool) -> anyhow::Result<()>` (async) -- parses `push_url` into a `reqwest::Url`, appends `status`/`msg` (`msg` defaults to `"OK"` for `PushStatus::Up` when its `message` is `None`, and is truncated via `truncate` for both `Up` and `Down`) and `ping` when known as query pairs, logs the final URL when `debug` is set, sends the GET request, and errors on a non-2xx response.
 
 Key internal functions:
 
