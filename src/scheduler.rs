@@ -6,7 +6,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval};
 use tracing::{error, info, warn};
 
-use crate::checks::ping;
+use crate::checks::{heartbeat, ping};
 use crate::config::{CheckConfig, CheckMode};
 use crate::kuma::{self, PushStatus};
 
@@ -68,18 +68,35 @@ async fn run_check_loop(
 /// the resulting status to Kuma.
 async fn run_once(check: &CheckConfig, client: &Client, debug: bool) -> anyhow::Result<()> {
     let status = match check.mode {
-        CheckMode::Ping => match ping::ping_once(check.host.clone()).await? {
-            ping::PingOutcome::Up { latency_ms } => {
-                info!(check_id = %check.id, name = %check.name, latency_ms, "Up");
-                PushStatus::Up {
-                    ping_ms: Some(latency_ms),
+        CheckMode::Ping => {
+            let host = check
+                .host
+                .as_ref()
+                .expect("Config::validate requires a host for mode ping")
+                .clone();
+            match ping::ping_once(host).await? {
+                ping::PingOutcome::Up { latency_ms } => {
+                    info!(check_id = %check.id, name = %check.name, latency_ms, "Up");
+                    PushStatus::Up {
+                        ping_ms: Some(latency_ms),
+                        message: None,
+                    }
+                }
+                ping::PingOutcome::Down { reason } => {
+                    warn!(check_id = %check.id, name = %check.name, reason = %reason, "Down");
+                    PushStatus::Down { message: reason }
                 }
             }
-            ping::PingOutcome::Down { reason } => {
-                warn!(check_id = %check.id, name = %check.name, reason = %reason, "Down");
-                PushStatus::Down { message: reason }
+        }
+        CheckMode::Heartbeat => {
+            let heartbeat::HeartbeatOutcome { latency_ms } =
+                heartbeat::beat_once(check.host.clone()).await;
+            info!(check_id = %check.id, name = %check.name, latency_ms, "Heartbeat");
+            PushStatus::Up {
+                ping_ms: latency_ms,
+                message: Some("Heartbeat".to_string()),
             }
-        },
+        }
     };
 
     kuma::push(client, &check.push_url, status, debug).await

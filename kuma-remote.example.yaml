@@ -2,12 +2,19 @@ debug: false #=-- optional, defaults to false
 report_run_failures: true #=-- optional, defaults to true
 
 checks:
+  - id: self
+    name: "Remote Agent Heartbeat"
+    mode: heartbeat #=-- always reports Up with msg "Heartbeat"; host is optional
+    host: 8.8.8.8 #=-- optional -- if set, also pings and includes latency, good for pinging 8.8.8.8 — or similar — for internet latency
+    push_url: "https://kuma.mydomain.com/api/push/HbEaT456"
+    interval: 60s
+    
   - id: web01
     name: "Prod Web Server"
     mode: ping
     host: 192.168.1.10
     push_url: "https://kuma.mydomain.com/api/push/AbC123XyZ"
-    interval: 60s #=-- It's recommended to set the heartbeat interval to at least 30 seconds longer than the longest expected check interval.
+    interval: 60s #=-- It's recommended to set the heartbeat interval to at least 30 seconds longer than the longest expected check interval
 
   - id: db01
     name: "Database Host"

@@ -66,7 +66,7 @@ async fn main() -> Result<()> {
                 check_id = %check.id,
                 name = %check.name,
                 mode = ?check.mode,
-                host = %check.host,
+                host = ?check.host,
                 push_url = %check.push_url,
                 interval = ?check.interval,
                 "Debug: check configured"

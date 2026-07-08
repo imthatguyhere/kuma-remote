@@ -29,16 +29,22 @@ The compiled binary is written to `target/release/kuma-remote` (`kuma-remote.exe
 Checks are defined in a [StrictYAML](https://hitchdev.com/strictyaml/) file. If `--config` is not given, `kuma-remote` looks in the current directory for `kuma-remote.yaml`, then `kuma-config.yaml`, then `config.yaml`, using the first one that exists. See `kuma-remote.example.yaml` for a working example.
 
 ```yaml
-debug: false # optional, defaults to false
-report_run_failures: true # optional, defaults to true
+debug: false #=-- optional, defaults to false
+report_run_failures: true #=-- optional, defaults to true
 
 checks:
+  - id: self
+    name: "Remote Agent Heartbeat"
+    mode: heartbeat #=-- always reports Up with msg "Heartbeat"; host is optional
+    host: 8.8.8.8 #=-- optional -- if set, also pings and includes latency, good for pinging 8.8.8.8 — or similar — for internet latency
+    push_url: "https://kuma.mydomain.com/api/push/HbEaT456"
+    interval: 60s
   - id: web01
     name: "Prod Web Server"
     mode: ping
     host: 192.168.1.10
     push_url: "https://kuma.mydomain.com/api/push/AbC123XyZ"
-    interval: 60s
+    interval: 60s #=-- It's recommended to set the heartbeat interval to at least 30 seconds longer than the longest expected check interval
 
   - id: db01
     name: "Database Host"
@@ -54,16 +60,16 @@ Top-level fields:
 - `report_run_failures` -- optional, defaults to `true`. When `true`, a check run that errors out entirely (e.g. an unresolvable hostname) is also pushed to Kuma as a `down` status with the error as `msg`, in addition to being logged. On by default: without it, a run error sends no heartbeat at all, leaving the Kuma monitor stuck on its last known state instead of reflecting the failure. Set to `false` to only log run errors and never push for them.
 - `checks` -- the list of checks to run, described below.
 
-Fields, per entry under `checks` (all required):
+Fields, per entry under `checks`:
 
-- `id` -- Unique slug for this check. Duplicate ids are a startup error.
-- `name` -- Human-readable name, used only in logs.
-- `mode` -- Check strategy. Currently only `ping` (see Tracked Software below).
-- `host` -- IP address or hostname to check.
-- `push_url` -- Full Uptime Kuma push URL for this monitor. Kuma's dashboard displays the push URL with a `?status=up&msg=OK&ping=` example suffix attached for you to copy as a curl command; `kuma-remote` builds its own `status`/`msg`/`ping` query string, so if `push_url` still has a `?...` suffix on load, it's stripped automatically and logged as a warning rather than rejected.
-- `interval` -- How often to run the check, as a duration string (`30s`, `5m`, `1h`, ...).
+- `id` -- Required. Unique slug for this check. Duplicate ids are a startup error.
+- `name` -- Required. Human-readable name, used only in logs.
+- `mode` -- Required. Check strategy: `ping` or `heartbeat` (see Check Modes below).
+- `host` -- IP address or hostname to check. Required for `ping`. Optional for `heartbeat`: when set, it's also pinged and a successful latency is included in the push; a missing host, or a failed/timed-out ping, doesn't affect the heartbeat's `Up` status.
+- `push_url` -- Required. Full Uptime Kuma push URL for this monitor. Kuma's dashboard displays the push URL with a `?status=up&msg=OK&ping=` example suffix attached for you to copy as a curl command; `kuma-remote` builds its own `status`/`msg`/`ping` query string, so if `push_url` still has a `?...` suffix on load, it's stripped automatically and logged as a warning rather than rejected.
+- `interval` -- Required. How often to run the check, as a duration string (`30s`, `5m`, `1h`, ...).
 
-The config file must define at least one check; a zero-length `interval` or a duplicate `id` is rejected at startup.
+The config file must define at least one check; a zero-length `interval`, a duplicate `id`, or a `ping` check missing `host` is rejected at startup.
 
 ### Environment variables
 
@@ -105,12 +111,15 @@ Each check's task loop is independent: a slow or failing check never blocks or d
 - `config.rs` -- StrictYAML config schema (`Config`, `CheckConfig`, `CheckMode`) and validation.
 - `scheduler.rs` -- Per-check interval loop; dispatches to the check's mode and pushes the result.
 - `checks/ping.rs` -- Ping check: single ICMP echo per run, cross-platform via the `pinger` crate.
+- `checks/heartbeat.rs` -- Heartbeat check: always reports up, optionally pinging `host` for latency.
 - `kuma.rs` -- Uptime Kuma push client (builds the `status`/`msg`/`ping` query string, sends the GET request).
 - `logging.rs` -- `tracing` subscriber setup.
 
 ## Check Modes
 
-- `ping` -- Sends a single ICMP echo to `host` and reports latency (up) or the failure reason (down).
+- `ping` -- Sends a single ICMP echo to `host` and reports latency (up) or the failure reason (down). `host` is required.
+- `heartbeat` -- Always reports up with message "Heartbeat", signaling the `kuma-remote` process itself is alive rather than testing reachability.
+  - `host` is optional; if set, it's also pinged once and a successful latency is included, but a failed or missing ping never turns the heartbeat down.
 
 ## License
 

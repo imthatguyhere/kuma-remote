@@ -15,8 +15,13 @@ const MAX_MESSAGE_LEN: usize = 250;
 
 /// Outcome of a single check run, translated into Kuma's push vocabulary.
 pub enum PushStatus {
-    /// Host is reachable. `ping_ms` is omitted when latency isn't known.
-    Up { ping_ms: Option<f64> },
+    /// Host is reachable, or the check otherwise passed. `ping_ms` is
+    /// omitted when latency isn't known. `message` defaults to `"OK"` when
+    /// `None`.
+    Up {
+        ping_ms: Option<f64>,
+        message: Option<String>,
+    },
     /// Host is unreachable or the check otherwise failed.
     Down { message: String },
 }
@@ -30,8 +35,11 @@ pub async fn push(client: &Client, push_url: &str, status: PushStatus, debug: bo
     {
         let mut query = url.query_pairs_mut();
         match status {
-            PushStatus::Up { ping_ms } => {
-                query.append_pair("status", "up").append_pair("msg", "OK");
+            PushStatus::Up { ping_ms, message } => {
+                let message = truncate(message.as_deref().unwrap_or("OK"), MAX_MESSAGE_LEN);
+                query
+                    .append_pair("status", "up")
+                    .append_pair("msg", &message);
                 if let Some(ping_ms) = ping_ms {
                     query.append_pair("ping", &format!("{ping_ms:.0}"));
                 }
