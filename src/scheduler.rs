@@ -71,8 +71,9 @@ async fn run_once(check: &CheckConfig, client: &Client, debug: bool) -> anyhow::
         CheckMode::Ping => {
             let host = check
                 .host
-                .clone()
-                .expect("Config::validate requires a host for mode ping");
+                .as_ref()
+                .expect("Config::validate requires a host for mode ping")
+                .clone();
             match ping::ping_once(host).await? {
                 ping::PingOutcome::Up { latency_ms } => {
                     info!(check_id = %check.id, name = %check.name, latency_ms, "Up");
