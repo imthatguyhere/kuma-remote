@@ -36,10 +36,10 @@ pub async fn push(client: &Client, push_url: &str, status: PushStatus, debug: bo
         let mut query = url.query_pairs_mut();
         match status {
             PushStatus::Up { ping_ms, message } => {
-                let message = message.as_deref().unwrap_or("OK");
+                let message = truncate(message.as_deref().unwrap_or("OK"), MAX_MESSAGE_LEN);
                 query
                     .append_pair("status", "up")
-                    .append_pair("msg", message);
+                    .append_pair("msg", &message);
                 if let Some(ping_ms) = ping_ms {
                     query.append_pair("ping", &format!("{ping_ms:.0}"));
                 }
