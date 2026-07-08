@@ -42,8 +42,11 @@ pub struct CheckConfig {
     pub name: String,
     /// Check strategy to run against `host`.
     pub mode: CheckMode,
-    /// IP address or hostname to check.
-    pub host: String,
+    /// IP address or hostname to check. Required for `Ping`; optional for
+    /// `Heartbeat`, where it enables an additional reachability ping
+    /// alongside the heartbeat.
+    #[serde(default)]
+    pub host: Option<String>,
     /// Full Uptime Kuma push URL, without a query string.
     pub push_url: String,
     /// How often to run this check, e.g. "60s", "5m", "1h".
@@ -51,11 +54,16 @@ pub struct CheckConfig {
     pub interval: Duration,
 }
 
-/// Check strategy. Only `Ping` exists today; more modes extend this enum.
+/// Check strategy. More modes extend this enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CheckMode {
+    /// Pings `host` (required) and reports `Up`/`Down` based on the reply.
     Ping,
+    /// Always reports `Up` with message "Heartbeat", without checking
+    /// anything. If `host` is given, also pings it and includes the
+    /// latency; a failed ping does not turn the heartbeat `Down`.
+    Heartbeat,
 }
 
 impl Config {
@@ -100,6 +108,9 @@ impl Config {
             }
             if check.interval.is_zero() {
                 bail!("Check {} has a zero interval", check.id);
+            }
+            if check.mode == CheckMode::Ping && check.host.is_none() {
+                bail!("Check {} uses mode ping, which requires a host", check.id);
             }
         }
         Ok(())
