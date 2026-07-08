@@ -5,6 +5,8 @@
 //! `host`. So when `host` is given and the ping fails, the heartbeat still
 //! reports `Up` -- just without a latency figure.
 
+use tracing::warn;
+
 use crate::checks::ping::{self, PingOutcome};
 
 /// Result of running a heartbeat check: always `Up`, with an optional
@@ -18,10 +20,20 @@ pub struct HeartbeatOutcome {
 /// omits the latency rather than failing the check.
 pub async fn beat_once(host: Option<String>) -> HeartbeatOutcome {
     let latency_ms = match host {
-        Some(host) => match ping::ping_once(host).await {
-            Ok(PingOutcome::Up { latency_ms }) => Some(latency_ms),
-            Ok(PingOutcome::Down { .. }) | Err(_) => None,
-        },
+        Some(host) => {
+            let host_display = host.clone();
+            match ping::ping_once(host).await {
+                Ok(PingOutcome::Up { latency_ms }) => Some(latency_ms),
+                Ok(PingOutcome::Down { reason }) => {
+                    warn!(host = %host_display, reason = %reason, "Heartbeat diagnostic ping failed");
+                    None
+                }
+                Err(err) => {
+                    warn!(host = %host_display, error = %err, "Heartbeat diagnostic ping errored");
+                    None
+                }
+            }
+        }
         None => None,
     };
 
