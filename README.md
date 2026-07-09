@@ -15,6 +15,7 @@ It runs as a long-lived daemon: each configured check runs independently on its 
 - Network access from the machine running `kuma-remote` to both the checked hosts and the Uptime Kuma push URL.
 - No administrator/root privileges are required. On Windows, pings use the native `IcmpSendEcho` API; on Linux/macOS, the OS `ping` binary is invoked directly (no raw-socket capability needed).
 - If the push URL sits behind a reverse proxy or WAF, note that `kuma-remote` sends push requests with a desktop-Chrome-on-Windows `User-Agent` header (not a generic HTTP-client string) specifically to avoid bot-protection false positives; adjust any allowlists accordingly if you rely on user-agent filtering.
+- Unless `auto_update: false` is set, the machine also needs outbound HTTPS access to `api.github.com` and `github.com` (release asset downloads), and the process needs write access to its own install directory so it can replace its executable.
 
 ## Building
 
@@ -31,6 +32,7 @@ Checks are defined in a [StrictYAML](https://hitchdev.com/strictyaml/) file. If 
 ```yaml
 debug: false #=-- optional, defaults to false
 report_run_failures: true #=-- optional, defaults to true
+auto_update: true #=-- optional, defaults to true; checks GitHub for a newer release at startup and self-updates
 
 checks:
   - id: self
@@ -39,6 +41,7 @@ checks:
     host: 8.8.8.8 #=-- optional -- if set, also pings and includes latency, good for pinging 8.8.8.8 — or similar — for internet latency
     push_url: "https://kuma.mydomain.com/api/push/HbEaT456"
     interval: 60s
+    
   - id: web01
     name: "Prod Web Server"
     mode: ping
@@ -58,6 +61,7 @@ Top-level fields:
 
 - `debug` -- optional, defaults to `false`. When `true`, every configured check is logged at startup, and every push logs the exact request URL sent to Kuma, including its query string. Leave this off unless you're actively troubleshooting: a push URL is itself a bearer credential (anyone who has it can push status to your monitor), so `kuma-remote` doesn't log it by default.
 - `report_run_failures` -- optional, defaults to `true`. When `true`, a check run that errors out entirely (e.g. an unresolvable hostname) is also pushed to Kuma as a `down` status with the error as `msg`, in addition to being logged. On by default: without it, a run error sends no heartbeat at all, leaving the Kuma monitor stuck on its last known state instead of reflecting the failure. Set to `false` to only log run errors and never push for them.
+- `auto_update` -- optional, defaults to `true`. See [Auto-Update](#auto-update) below.
 - `checks` -- the list of checks to run, described below.
 
 Fields, per entry under `checks`:
@@ -89,7 +93,7 @@ kuma-remote [--config <path>]
 
 ## Output
 
-`kuma-remote` writes structured log lines to stdout only (via `tracing_subscriber`); there is no log file. Each check logs one `up` or `down` line per run, including the check id, name, and (for ping) latency in milliseconds or the failure reason. There are no report tables — each push result is sent directly to Uptime Kuma, which is the system of record for check history.
+`kuma-remote` writes structured log lines to stdout only (via `tracing_subscriber`); there is no log file. On boot, before loading config, it logs its own name, version, and author(s). Each check logs one `up` or `down` line per run, including the check id, name, and (for ping) latency in milliseconds or the failure reason. There are no report tables — each push result is sent directly to Uptime Kuma, which is the system of record for check history.
 
 ## Architecture
 
@@ -105,6 +109,12 @@ config.yaml --> Config::load (StrictYAML) --> scheduler::spawn_all
 
 Each check's task loop is independent: a slow or failing check never blocks or delays any other check's schedule.
 
+## Auto-Update
+
+Unless `auto_update: false` is set, `kuma-remote` checks the latest GitHub release of this repo at startup, before starting any checks. It compares the SHA-256 of its own running executable (not its version number) against the digest GitHub publishes for the matching release asset. If they differ, it downloads the new executable, verifies its hash, replaces itself in place, and immediately restarts into the new version -- so a detected update causes a brief restart and resets every check's interval countdown.
+
+Any failure in this process -- no network access, GitHub rate limiting, no matching release asset, no write permission to the install directory, and so on -- is logged and otherwise ignored; it never prevents `kuma-remote` from starting with the currently installed version.
+
 ## Modules
 
 - `main.rs` -- CLI parsing, config load, task spawning, shutdown on Ctrl-C.
@@ -114,6 +124,7 @@ Each check's task loop is independent: a slow or failing check never blocks or d
 - `checks/heartbeat.rs` -- Heartbeat check: always reports up, optionally pinging `host` for latency.
 - `kuma.rs` -- Uptime Kuma push client (builds the `status`/`msg`/`ping` query string, sends the GET request).
 - `logging.rs` -- `tracing` subscriber setup.
+- `updater.rs` -- checks GitHub's latest release for a newer build and self-replaces/restarts when found.
 
 ## Check Modes
 
