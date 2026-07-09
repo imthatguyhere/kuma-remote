@@ -8,7 +8,7 @@
 2. `main.rs` parses CLI args, resolves the config path via `resolve_config_path` (the explicit `--config` value, or else the first of `kuma-remote.yaml`/`kuma-config.yaml`/`config.yaml` that exists), then calls `config::Config::load` with it.
 3. `config::Config::load` reads the file, deserializes it as StrictYAML into `Config`, normalizes it, and validates it (non-empty, unique `id`s, non-zero `interval`s, `host` present for `ping` checks).
 4. If `config.debug` is set, `main.rs` logs every configured check before starting.
-5. `main.rs` builds a single shared `reqwest::Client`. If `config.auto_update` is set, it then calls `updater::check_and_update` with that client before doing anything else -- see `updater.rs` below. On an applied update this ends the process (it restarts into the replacement); otherwise it logs and falls through to normal startup regardless of outcome.
+5. `main.rs` builds a single shared `reqwest::Client`. If `config.auto_update` is set, it then calls `updater::check_and_update` with that client before doing anything else -- see `updater.rs` below. On an applied update this exits the process (relying on the process supervisor to restart it into the replacement -- `kuma-remote` does not relaunch itself); otherwise it logs and falls through to normal startup regardless of outcome.
 6. `main.rs` calls `scheduler::spawn_all` (passing `config.debug` and `config.report_run_failures` through), which spawns one tokio task per `CheckConfig`.
 7. Each task loops: wait for its `interval` tick, run the check for its `mode` (`ping` requires `host` and reports `Up`/`Down` based on the ping result; `heartbeat` always reports `Up` with message `"Heartbeat"`, optionally including a latency if `host` is set and the ping succeeds), translate the result into a `kuma::PushStatus`, and call `kuma::push`. If the run itself errors out (rather than completing with an `Up`/`Down` result), the error is logged and, when `report_run_failures` is set, also pushed to Kuma as a `down` status with the error as `msg`.
 8. `kuma::push` builds the final push URL (`status`/`msg`/`ping` query parameters appended to `push_url`), logs it if `debug` is set, sends the GET request, and treats a non-2xx response as an error.
@@ -147,16 +147,12 @@ Public functions:
 
 ## `updater.rs`
 
-Purpose: startup self-updater -- checks GitHub's latest release for a newer build of the running executable and replaces/restarts itself when found.
+Purpose: startup self-updater -- checks GitHub's latest release for a newer build of the running executable, replaces it in place when found, and exits so the process supervisor restarts into it (deliberately does not spawn a replacement itself -- see the module doc for why: it would race a supervisor's own restart-on-exit and can leave two permanent duplicate instances running after every update).
 
 Types:
 
 - `Release { assets: Vec<Asset> }` -- subset of GitHub's `GET /repos/{owner}/{repo}/releases/latest` response.
 - `Asset { name: String, digest: Option<String>, browser_download_url: String }` -- subset of a release asset; `digest` is GitHub-computed (`"sha256:<hex>"`), present on assets uploaded since GitHub added artifact digests.
-
-Constants:
-
-- `REPO_OWNER: &str = "imthatguyhere"`, `REPO_NAME: &str = "kuma-remote"` -- this project's own GitHub repo, hardcoded rather than configurable.
 
 Public functions:
 
@@ -164,14 +160,15 @@ Public functions:
 
 Key internal functions:
 
+- `repository_owner_and_name() -> anyhow::Result<(&'static str, &'static str)>` -- splits Cargo.toml's `package.repository` URL (read via `env!("CARGO_PKG_REPOSITORY")`) into `(owner, name)`, so the GitHub repo checked for updates has a single source of truth instead of separately hardcoded constants.
 - `try_update(client: &Client) -> anyhow::Result<()>` (async) -- the full check/update flow:
-  1. Resolves the running executable's path and file name via `std::env::current_exe()`.
+  1. Resolves `(repo_owner, repo_name)` via `repository_owner_and_name`, and the running executable's path and file name via `std::env::current_exe()`.
   2. Fetches the latest release via the GitHub API and finds the asset whose `name` matches the running exe's file name; logs and returns `Ok(())` if none matches (e.g. no released asset for the current platform).
   3. Strips the `sha256:` prefix from that asset's `digest`; logs and returns `Ok(())` if it has none.
   4. Hashes the running exe's own bytes (`sha2::Sha256` over `std::fs::read` of `current_exe()`) and compares (case-insensitive) to the remote digest; logs and returns `Ok(())` if they match.
   5. On a mismatch, downloads the asset fully into memory, hashes it, and `bail!`s if that hash doesn't match the published digest (refuses to install a corrupted/tampered download).
   6. Writes the verified bytes to a sibling temp path (`exe_path.with_extension("exe.new")`, same directory as the running exe so the replace stays on one filesystem), calls `self_replace::self_replace` on it, then best-effort deletes the temp file.
-  7. Spawns a new process at the same exe path with the same CLI args (`std::env::args_os().skip(1)`) and calls `std::process::exit(0)` -- this function does not return past this point.
+  7. Calls `std::process::exit(0)` -- this function does not return past this point, and deliberately does not spawn a new process itself; the exit is what lets a restart-on-exit supervisor (NSSM, a `Restart=` systemd unit, ...) bring the new binary up.
 - `to_hex(bytes: &[u8]) -> String` -- lowercase-hex-encodes bytes to match the format of GitHub's `digest` field for direct string comparison.
 
-Key algorithm / fail-open contract: every fallible step above returns via `anyhow::Result` and `?`/`Context`, but the only caller (`check_and_update`) never propagates an error -- it logs a `warn!` and lets `main.rs` continue starting checks with the current binary regardless of what went wrong (unreachable GitHub, rate limiting, no matching asset, missing digest, corrupted download, no write permission to the install directory, failure to spawn the replacement, ...). Only a fully verified, successfully-installed update causes a restart. Asset matching by the running exe's own file name (rather than a hardcoded `"kuma-remote.exe"`) keeps the logic platform-agnostic without `cfg(windows)` branches.
+Key algorithm / fail-open contract: every fallible step above returns via `anyhow::Result` and `?`/`Context`, but the only caller (`check_and_update`) never propagates an error -- it logs a `warn!` and lets `main.rs` continue starting checks with the current binary regardless of what went wrong (unreachable GitHub, rate limiting, no matching asset, missing digest, corrupted download, no write permission to the install directory, ...). Only a fully verified, successfully-installed update causes an exit. Asset matching by the running exe's own file name (rather than a hardcoded `"kuma-remote.exe"`) keeps the logic platform-agnostic without `cfg(windows)` branches. The process is not relaunched in-process: see the module doc for why self-spawning would conflict with supervisor-driven restarts.

@@ -111,7 +111,9 @@ Each check's task loop is independent: a slow or failing check never blocks or d
 
 ## Auto-Update
 
-Unless `auto_update: false` is set, `kuma-remote` checks the latest GitHub release of this repo at startup, before starting any checks. It compares the SHA-256 of its own running executable (not its version number) against the digest GitHub publishes for the matching release asset. If they differ, it downloads the new executable, verifies its hash, replaces itself in place, and immediately restarts into the new version -- so a detected update causes a brief restart and resets every check's interval countdown.
+Unless `auto_update: false` is set, `kuma-remote` checks the latest GitHub release of this repo at startup, before starting any checks. It compares the SHA-256 of its own running executable (not its version number) against the digest GitHub publishes for the matching release asset. If they differ, it downloads the new executable, verifies its hash, replaces itself in place, and exits -- it does **not** relaunch itself.
+
+Restarting into the new version is left entirely to whatever supervises the process, on purpose: if `kuma-remote` also spawned its own replacement, a supervisor that restarts on any exit (NSSM's default `AppExit` behavior, or a systemd unit with `Restart=always`) would restart it too, leaving both processes running permanently and double-reporting every check to Kuma. **To get an update to actually take effect automatically, run `kuma-remote` under a supervisor configured to restart it on exit** (NSSM's default settings already do this; for systemd, use `Restart=always` or `Restart=on-success`). Without such a supervisor -- e.g. running it directly in a console -- an update replaces the file on disk but the process simply stops; it needs a manual restart to pick up the new binary.
 
 Any failure in this process -- no network access, GitHub rate limiting, no matching release asset, no write permission to the install directory, and so on -- is logged and otherwise ignored; it never prevents `kuma-remote` from starting with the currently installed version.
 
