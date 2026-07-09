@@ -7,6 +7,7 @@ mod config;
 mod kuma;
 mod logging;
 mod scheduler;
+mod updater;
 
 use std::path::PathBuf;
 
@@ -43,11 +44,19 @@ fn resolve_config_path(explicit: Option<PathBuf>) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_CANDIDATES[0]))
 }
 
-/// Entry point: load config, spawn one scheduler task per check, then block
-/// until Ctrl-C and abort all check tasks.
+/// Entry point: log the app name/version/authors, load config, run the
+/// startup self-update check (if enabled), spawn one scheduler task per
+/// check, then block until Ctrl-C and abort all check tasks.
 #[tokio::main]
 async fn main() -> Result<()> {
     logging::init();
+
+    tracing::info!(
+        name = env!("CARGO_PKG_NAME"),
+        version = env!("CARGO_PKG_VERSION"),
+        authors = env!("CARGO_PKG_AUTHORS"),
+        "kuma-remote starting"
+    );
 
     let cli = Cli::parse();
     let config_path = resolve_config_path(cli.config);
@@ -57,7 +66,7 @@ async fn main() -> Result<()> {
     tracing::info!(
         checks = config.checks.len(),
         debug = config.debug,
-        "Starting kuma-remote"
+        "Config loaded"
     );
 
     if config.debug {
@@ -85,6 +94,11 @@ async fn main() -> Result<()> {
         )
         .build()
         .context("Building HTTP client")?;
+
+    if config.auto_update {
+        updater::check_and_update(&client).await;
+    }
+
     let handles = scheduler::spawn_all(
         config.checks,
         client,
