@@ -2,7 +2,18 @@
 //! release asset matching the currently running executable's file name, and
 //! compares its GitHub-computed SHA-256 digest against the running exe's own
 //! hash. On a mismatch, downloads the asset, verifies its hash, replaces the
-//! running exe in place, and restarts into it.
+//! running exe in place, and exits so the process supervisor -- a Windows
+//! service manager, a systemd unit with `Restart=`, etc. -- restarts it into
+//! the new binary.
+//!
+//! Deliberately does not spawn a replacement process itself: doing so races
+//! a supervisor's own restart-on-exit behavior. A supervisor that restarts
+//! on any exit (e.g. NSSM's default `AppExit`, or a systemd unit with
+//! `Restart=always`) would then run both our self-spawned child and its own
+//! fresh instance, permanently doubling up on every update. Exiting and
+//! leaving the restart entirely to whatever supervises the process keeps
+//! exactly one instance running in every case, at the cost of the update
+//! only taking effect once something actually restarts kuma-remote.
 //!
 //! Every failure mode here (network, rate limiting, missing digest, no
 //! matching asset, permissions, ...) is logged and swallowed rather than
@@ -14,11 +25,6 @@ use reqwest::Client;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
-
-/// GitHub repo this binary is published from.
-const REPO_OWNER: &str = "imthatguyhere";
-/// GitHub repo this binary is published from.
-const REPO_NAME: &str = "kuma-remote";
 
 /// Subset of GitHub's release API response we care about.
 #[derive(Debug, Deserialize)]
@@ -40,9 +46,10 @@ struct Asset {
 /// Checks for a newer release and self-updates if `client` can reach GitHub
 /// and the running exe's file name matches a release asset with a different
 /// digest. Never fails startup: any error along the way is logged as a
-/// warning and swallowed. On a successful update this spawns the replacement
-/// process and calls [`std::process::exit`] -- it does not return in that
-/// case.
+/// warning and swallowed. On a successful update this calls
+/// [`std::process::exit`] after replacing the binary on disk, relying on the
+/// process supervisor to restart into it -- it does not return, and does not
+/// spawn a replacement itself (see module docs for why).
 pub async fn check_and_update(client: &Client) {
     if let Err(err) = try_update(client).await {
         warn!(error = %err, "Auto-update check failed, continuing with current version");
@@ -52,6 +59,8 @@ pub async fn check_and_update(client: &Client) {
 /// Does the actual check-download-verify-replace-restart work. See the
 /// module doc for the overall flow and its fail-open contract.
 async fn try_update(client: &Client) -> Result<()> {
+    let (repo_owner, repo_name) = repository_owner_and_name()?;
+
     let exe_path = std::env::current_exe().context("Locating current executable")?;
     let exe_name = exe_path
         .file_name()
@@ -60,7 +69,7 @@ async fn try_update(client: &Client) -> Result<()> {
 
     let release: Release = client
         .get(format!(
-            "https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/releases/latest"
+            "https://api.github.com/repos/{repo_owner}/{repo_name}/releases/latest"
         ))
         .header("Accept", "application/vnd.github+json")
         .send()
@@ -135,14 +144,7 @@ async fn try_update(client: &Client) -> Result<()> {
     // a leftover temp file here is harmless clutter, not a correctness issue.
     let _ = std::fs::remove_file(&tmp_path);
 
-    info!("Update applied, restarting into new version");
-
-    let args: Vec<_> = std::env::args_os().skip(1).collect();
-    std::process::Command::new(&exe_path)
-        .args(&args)
-        .spawn()
-        .context("Spawning updated executable")?;
-
+    info!("Update applied on disk; exiting so the process supervisor restarts into it");
     std::process::exit(0);
 }
 
@@ -150,4 +152,20 @@ async fn try_update(client: &Client) -> Result<()> {
 /// field so the two can be compared directly.
 fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Splits Cargo.toml's `package.repository` (e.g.
+/// `https://github.com/imthatguyhere/kuma-remote`) into `(owner, name)`, so
+/// the GitHub repo this binary checks for updates against has one source of
+/// truth instead of being duplicated as separate constants here.
+fn repository_owner_and_name() -> Result<(&'static str, &'static str)> {
+    const REPOSITORY_URL: &str = env!("CARGO_PKG_REPOSITORY");
+    let mut segments = REPOSITORY_URL.trim_end_matches('/').rsplit('/');
+    let name = segments
+        .next()
+        .context("Cargo.toml `repository` is missing a repo name segment")?;
+    let owner = segments
+        .next()
+        .context("Cargo.toml `repository` is missing an owner segment")?;
+    Ok((owner, name))
 }
