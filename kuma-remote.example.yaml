@@ -1,5 +1,6 @@
 debug: false #=-- optional, defaults to false
 report_run_failures: true #=-- optional, defaults to true
+auto_update: true #=-- optional, defaults to true; checks GitHub for a newer release at startup and self-updates
 
 checks:
   - id: self
