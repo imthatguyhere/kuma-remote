@@ -25,11 +25,21 @@ pub struct Config {
     /// last known state (or pending) instead of reflecting the failure.
     #[serde(default = "default_report_run_failures")]
     pub report_run_failures: bool,
+    /// When true (default), checks GitHub for a newer kuma-remote release at
+    /// startup and replaces this binary in place before starting any checks.
+    /// See `updater.rs`.
+    #[serde(default = "default_auto_update")]
+    pub auto_update: bool,
     pub checks: Vec<CheckConfig>,
 }
 
 /// Default value for [`Config::report_run_failures`] when absent from the config file.
 fn default_report_run_failures() -> bool {
+    true
+}
+
+/// Default value for [`Config::auto_update`] when absent from the config file.
+fn default_auto_update() -> bool {
     true
 }
 
