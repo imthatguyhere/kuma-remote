@@ -1,26 +1,28 @@
 # Functionality
 
-> Module list adapted from the CLAUDE.md template: this project has no `installed.rs`/`cdk_info.rs` (those belong to a different, software-inventory project). Sections below cover this project's actual modules: `main.rs`, `config.rs`, `scheduler.rs`, `checks/ping.rs`, `checks/heartbeat.rs`, `kuma.rs`, `logging.rs`.
+> Module list adapted from the CLAUDE.md template: this project has no `installed.rs`/`cdk_info.rs` (those belong to a different, software-inventory project). Sections below cover this project's actual modules: `main.rs`, `config.rs`, `scheduler.rs`, `checks/ping.rs`, `checks/heartbeat.rs`, `kuma.rs`, `logging.rs`, `updater.rs`.
 
 ## Data Flow
 
-1. `main.rs` parses CLI args, resolves the config path via `resolve_config_path` (the explicit `--config` value, or else the first of `kuma-remote.yaml`/`kuma-config.yaml`/`config.yaml` that exists), then calls `config::Config::load` with it.
-2. `config::Config::load` reads the file, deserializes it as StrictYAML into `Config`, normalizes it, and validates it (non-empty, unique `id`s, non-zero `interval`s, `host` present for `ping` checks).
-3. If `config.debug` is set, `main.rs` logs every configured check before starting.
-4. `main.rs` builds a single shared `reqwest::Client` and calls `scheduler::spawn_all` (passing `config.debug` and `config.report_run_failures` through), which spawns one tokio task per `CheckConfig`.
-5. Each task loops: wait for its `interval` tick, run the check for its `mode` (`ping` requires `host` and reports `Up`/`Down` based on the ping result; `heartbeat` always reports `Up` with message `"Heartbeat"`, optionally including a latency if `host` is set and the ping succeeds), translate the result into a `kuma::PushStatus`, and call `kuma::push`. If the run itself errors out (rather than completing with an `Up`/`Down` result), the error is logged and, when `report_run_failures` is set, also pushed to Kuma as a `down` status with the error as `msg`.
-6. `kuma::push` builds the final push URL (`status`/`msg`/`ping` query parameters appended to `push_url`), logs it if `debug` is set, sends the GET request, and treats a non-2xx response as an error.
-7. `main.rs` blocks on Ctrl-C; on receipt, it aborts all spawned check tasks and exits.
+1. `main.rs` initializes logging, then immediately logs the app name, version, and author(s) (via `CARGO_PKG_NAME`/`CARGO_PKG_VERSION`/`CARGO_PKG_AUTHORS`), before any config is loaded.
+2. `main.rs` parses CLI args, resolves the config path via `resolve_config_path` (the explicit `--config` value, or else the first of `kuma-remote.yaml`/`kuma-config.yaml`/`config.yaml` that exists), then calls `config::Config::load` with it.
+3. `config::Config::load` reads the file, deserializes it as StrictYAML into `Config`, normalizes it, and validates it (non-empty, unique `id`s, non-zero `interval`s, `host` present for `ping` checks).
+4. If `config.debug` is set, `main.rs` logs every configured check before starting.
+5. `main.rs` builds a single shared `reqwest::Client`. If `config.auto_update` is set, it then calls `updater::check_and_update` with that client before doing anything else -- see `updater.rs` below. On an applied update this ends the process (it restarts into the replacement); otherwise it logs and falls through to normal startup regardless of outcome.
+6. `main.rs` calls `scheduler::spawn_all` (passing `config.debug` and `config.report_run_failures` through), which spawns one tokio task per `CheckConfig`.
+7. Each task loops: wait for its `interval` tick, run the check for its `mode` (`ping` requires `host` and reports `Up`/`Down` based on the ping result; `heartbeat` always reports `Up` with message `"Heartbeat"`, optionally including a latency if `host` is set and the ping succeeds), translate the result into a `kuma::PushStatus`, and call `kuma::push`. If the run itself errors out (rather than completing with an `Up`/`Down` result), the error is logged and, when `report_run_failures` is set, also pushed to Kuma as a `down` status with the error as `msg`.
+8. `kuma::push` builds the final push URL (`status`/`msg`/`ping` query parameters appended to `push_url`), logs it if `debug` is set, sends the GET request, and treats a non-2xx response as an error.
+9. `main.rs` blocks on Ctrl-C; on receipt, it aborts all spawned check tasks and exits.
 
 ## Configuration
 
-Single StrictYAML file. Path is set via `--config`, or else resolved by `main::resolve_config_path` to the first existing file among `kuma-remote.yaml`, `kuma-config.yaml`, `config.yaml` (falling back to `kuma-remote.yaml` if none exist, so the load error names a sensible file). Schema: a top-level `checks` sequence of mappings, each deserialized into `config::CheckConfig`. `interval` is parsed via `humantime_serde` from strings like `"30s"`/`"5m"`/`"1h"`. Deserialization uses `strict_yaml_rust::serde::from_str`.
+Single StrictYAML file. Path is set via `--config`, or else resolved by `main::resolve_config_path` to the first existing file among `kuma-remote.yaml`, `kuma-config.yaml`, `config.yaml` (falling back to `kuma-remote.yaml` if none exist, so the load error names a sensible file). Schema: a top-level `checks` sequence of mappings, each deserialized into `config::CheckConfig`. `interval` is parsed via `humantime_serde` from strings like `"30s"`/`"5m"`/`"1h"`. Deserialization uses `strict_yaml_rust::serde::from_str`. `auto_update` (`bool`, default `true` via `default_auto_update`) gates whether `updater::check_and_update` runs at all.
 
 The only other configuration source is the `RUST_LOG` environment variable, read by `logging::init` via `tracing_subscriber::EnvFilter`.
 
 ## Build and release packaging
 
-No non-default build behavior: standard `cargo build`/`cargo build --release`, no build script, no custom release profile.
+No non-default build behavior beyond `build.rs` (Windows icon resource via `winresource`) and the `[profile.release]` tuning in `Cargo.toml`. There is no CI/release pipeline; `scripts/build-release.ps1` builds and copies the exe into `dist/` for manual upload to a GitHub release. `updater.rs` relies on GitHub computing a SHA-256 `digest` for each uploaded release asset itself (returned by the releases API) -- no project-side checksum file is generated or required.
 
 ## `main.rs`
 
@@ -37,7 +39,7 @@ Constants:
 Functions:
 
 - `resolve_config_path(explicit: Option<PathBuf>) -> PathBuf` -- returns `explicit` if given; otherwise returns the first of `DEFAULT_CONFIG_CANDIDATES` that exists on disk, or the first candidate (`kuma-remote.yaml`) if none exist.
-- `main() -> anyhow::Result<()>` (async, `#[tokio::main]`) -- initializes logging, parses CLI args, resolves the config path via `resolve_config_path`, loads config, logs every check when `config.debug` is set, builds the shared `reqwest::Client` (with a desktop-Chrome `User-Agent` override -- see below), spawns the scheduler with `config.debug` and `config.report_run_failures`, waits on `tokio::signal::ctrl_c()`, then aborts all check task handles before returning.
+- `main() -> anyhow::Result<()>` (async, `#[tokio::main]`) -- initializes logging, logs the app name/version/authors (`env!("CARGO_PKG_NAME"/"CARGO_PKG_VERSION"/"CARGO_PKG_AUTHORS")`), parses CLI args, resolves the config path via `resolve_config_path`, loads config, logs every check when `config.debug` is set, builds the shared `reqwest::Client` (with a desktop-Chrome `User-Agent` override -- see below), runs `updater::check_and_update` when `config.auto_update` is set, spawns the scheduler with `config.debug` and `config.report_run_failures`, waits on `tokio::signal::ctrl_c()`, then aborts all check task handles before returning.
 
 Key detail: the `reqwest::Client` is built with `.user_agent(...)` set to a real desktop Chrome-on-Windows string instead of reqwest's default `reqwest/x.y.z`. Some reverse proxies / WAFs (e.g. Cloudflare bot protection) block generic HTTP-client user agents while allowing browsers, which otherwise manifests as push requests failing (404/403) even though the same URL works from a browser.
 
@@ -47,7 +49,7 @@ Purpose: StrictYAML config schema and validation.
 
 Types:
 
-- `Config { debug: bool, report_run_failures: bool, checks: Vec<CheckConfig> }` -- `debug` uses `#[serde(default)]` (defaults to `false`); `report_run_failures` uses `#[serde(default = "default_report_run_failures")]` (defaults to `true`).
+- `Config { debug: bool, report_run_failures: bool, auto_update: bool, checks: Vec<CheckConfig> }` -- `debug` uses `#[serde(default)]` (defaults to `false`); `report_run_failures` uses `#[serde(default = "default_report_run_failures")]` (defaults to `true`); `auto_update` uses `#[serde(default = "default_auto_update")]` (defaults to `true`).
 - `CheckConfig { id: String, name: String, mode: CheckMode, host: Option<String>, push_url: String, interval: Duration }` -- `interval` uses `#[serde(with = "humantime_serde")]`; `host` uses `#[serde(default)]` since it's only required for `CheckMode::Ping`.
 - `CheckMode` -- enum with variants `Ping` and `Heartbeat` (`#[serde(rename_all = "lowercase")]`, so the YAML scalars `ping`/`heartbeat` map to them). New check modes extend this enum.
 
@@ -60,6 +62,7 @@ Key internal functions:
 - `Config::normalize(&mut self)` -- corrects known copy-paste mistakes that have one unambiguous fix: if a `push_url` contains `?` (Kuma's dashboard shows the push URL with a `?status=up&msg=OK&ping=` example suffix attached, which users sometimes copy verbatim), it's truncated at the `?` and a warning is logged with the check id and original value.
 - `Config::validate(&self) -> anyhow::Result<()>` -- rejects an empty `checks` list, duplicate `id`s (via a `HashSet` of seen ids), any `interval` that is zero, and any `CheckMode::Ping` check whose `host` is `None`.
 - `default_report_run_failures() -> bool` -- serde default-value function for `Config::report_run_failures`; returns `true`.
+- `default_auto_update() -> bool` -- serde default-value function for `Config::auto_update`; returns `true`.
 
 ## `scheduler.rs`
 
@@ -141,3 +144,34 @@ Purpose: process-wide `tracing` subscriber setup.
 Public functions:
 
 - `init()` -- installs a `tracing_subscriber::fmt` subscriber using `EnvFilter` from `RUST_LOG`, defaulting to `info` if unset or invalid.
+
+## `updater.rs`
+
+Purpose: startup self-updater -- checks GitHub's latest release for a newer build of the running executable and replaces/restarts itself when found.
+
+Types:
+
+- `Release { assets: Vec<Asset> }` -- subset of GitHub's `GET /repos/{owner}/{repo}/releases/latest` response.
+- `Asset { name: String, digest: Option<String>, browser_download_url: String }` -- subset of a release asset; `digest` is GitHub-computed (`"sha256:<hex>"`), present on assets uploaded since GitHub added artifact digests.
+
+Constants:
+
+- `REPO_OWNER: &str = "imthatguyhere"`, `REPO_NAME: &str = "kuma-remote"` -- this project's own GitHub repo, hardcoded rather than configurable.
+
+Public functions:
+
+- `check_and_update(client: &Client)` (async) -- thin wrapper around `try_update` that logs and swallows any `Err` as a `warn!`; returns `()`, not `Result`, so the type itself documents that this can never fail startup. On a successful update, `try_update` does not return (see below), so this function doesn't return in that case either.
+
+Key internal functions:
+
+- `try_update(client: &Client) -> anyhow::Result<()>` (async) -- the full check/update flow:
+  1. Resolves the running executable's path and file name via `std::env::current_exe()`.
+  2. Fetches the latest release via the GitHub API and finds the asset whose `name` matches the running exe's file name; logs and returns `Ok(())` if none matches (e.g. no released asset for the current platform).
+  3. Strips the `sha256:` prefix from that asset's `digest`; logs and returns `Ok(())` if it has none.
+  4. Hashes the running exe's own bytes (`sha2::Sha256` over `std::fs::read` of `current_exe()`) and compares (case-insensitive) to the remote digest; logs and returns `Ok(())` if they match.
+  5. On a mismatch, downloads the asset fully into memory, hashes it, and `bail!`s if that hash doesn't match the published digest (refuses to install a corrupted/tampered download).
+  6. Writes the verified bytes to a sibling temp path (`exe_path.with_extension("exe.new")`, same directory as the running exe so the replace stays on one filesystem), calls `self_replace::self_replace` on it, then best-effort deletes the temp file.
+  7. Spawns a new process at the same exe path with the same CLI args (`std::env::args_os().skip(1)`) and calls `std::process::exit(0)` -- this function does not return past this point.
+- `to_hex(bytes: &[u8]) -> String` -- lowercase-hex-encodes bytes to match the format of GitHub's `digest` field for direct string comparison.
+
+Key algorithm / fail-open contract: every fallible step above returns via `anyhow::Result` and `?`/`Context`, but the only caller (`check_and_update`) never propagates an error -- it logs a `warn!` and lets `main.rs` continue starting checks with the current binary regardless of what went wrong (unreachable GitHub, rate limiting, no matching asset, missing digest, corrupted download, no write permission to the install directory, failure to spawn the replacement, ...). Only a fully verified, successfully-installed update causes a restart. Asset matching by the running exe's own file name (rather than a hardcoded `"kuma-remote.exe"`) keeps the logic platform-agnostic without `cfg(windows)` branches.
