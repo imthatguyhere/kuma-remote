@@ -35,7 +35,7 @@ report_run_failures: true #=-- optional, defaults to true
 auto_update: true #=-- optional, defaults to true; checks GitHub for a newer release at startup and self-updates
 service_mode: false #=-- optional, defaults to false; true = defer restart-on-update and single-instance to a process supervisor instead of self-managing them
 instance_lock: true #=-- optional, defaults to true; ignored when service_mode is true. Set false to disable the single-instance guard
-instance_lock_port: 51247 #=-- optional, defaults to 51247; loopback port used only as a single-instance mutex, change if it collides with something else on the host
+instance_lock_port: 51247 #=-- optional, defaults to 51247; loopback port used only as a single-instance mutex, change if it collides with something else on the host. Must be non-zero when the lock is in effect (instance_lock: true and service_mode: false) -- 0 is rejected at startup
 
 checks:
   - id: self
@@ -117,14 +117,16 @@ Each check's task loop is independent: a slow or failing check never blocks or d
 
 ## Auto-Update
 
-Unless `auto_update: false` is set, `kuma-remote` checks the latest GitHub release of this repo at startup, before starting any checks. It compares the SHA-256 of its own running executable (not its version number) against the digest GitHub publishes for the matching release asset. If they differ, it downloads the new executable and verifies its hash, then does one of two things depending on `service_mode`:
+Unless `auto_update: false` is set, `kuma-remote` checks the latest GitHub release of this repo at startup, before starting any checks. It compares the SHA-256 of its own running executable (not its version number) against the digest GitHub publishes for the matching release asset. If they differ, it downloads the new executable and verifies its hash, then replaces itself in place. What happens next depends on whether this process actually holds the single-instance lock (see below), not just on `service_mode`:
 
-- **`service_mode: false` (default)** -- replaces itself in place, spawns a replacement process running the new binary, and exits. The update takes effect immediately, with no supervisor (Windows service manager, systemd, ...) required. To make this safe under a supervisor that *also* restarts the process on exit (e.g. NSSM's default behavior, or a systemd unit with `Restart=always`) -- which would otherwise leave both the self-spawned replacement and the supervisor's own fresh instance running permanently, double-reporting every check -- every process claims a loopback TCP single-instance lock (`instance_lock_port`, default `51247`) before doing any real work, whether that process was self-spawned or started by a supervisor. Only one can hold it at a time; whichever loses the race just exits immediately without touching any checks. Set `instance_lock: false` to disable this guard (not recommended unless you have a specific reason to).
-- **`service_mode: true`** -- replaces itself in place and exits, full stop; no replacement process, no single-instance lock. Use this when a process supervisor is already responsible for restarting `kuma-remote` and you'd rather it own that job entirely. **Without a supervisor configured to restart on exit, an update will leave the process stopped** until something else starts it again.
+- **Lock held (`service_mode: false` and `instance_lock: true`, the defaults)** -- spawns a replacement process running the new binary, then exits. The update takes effect immediately, with no supervisor (Windows service manager, systemd, ...) required.
+- **Lock not held (`service_mode: true`, or `instance_lock: false`, or the lock claim came back unavailable)** -- just exits, full stop; no replacement process spawned. Use `service_mode: true` when a process supervisor is already responsible for restarting `kuma-remote` and you'd rather it own that job entirely; `instance_lock: false` falls back to the same behavior since self-spawning without the lock's protection would risk an unprotected duplicate instance. **Without a supervisor configured to restart on exit, an update in this mode will leave the process stopped** until something else starts it again.
 
-One consequence of the single-instance lock, when it's in use (`service_mode: false` and `instance_lock: true`, the defaults): **only one `kuma-remote` instance can run per machine at a time** -- if you need two independent sets of checks, put them all in one config file instead of running two instances.
+Self-spawning on its own would double-report every check if a process supervisor *also* restarts the process on exit (e.g. NSSM's default behavior, or a systemd unit with `Restart=always`) -- both the self-spawned replacement and the supervisor's own fresh instance would end up running permanently. This is closed by a single-instance lock: every process (self-spawned, supervisor-spawned, or a plain accidental double-launch) claims a loopback TCP port (`instance_lock_port`, default `51247`) before doing any real work, whether or not an update is even in play. Only one can hold it at a time; whichever loses just exits immediately without touching any checks. To tell a genuine second `kuma-remote` instance apart from some unrelated process that merely happens to be bound to the same port, the lock holder answers a short identity handshake -- a collision with an unrelated occupant is treated as "proceed anyway, without the guarantee," not as a duplicate instance. Set `instance_lock: false` to disable this guard entirely (not recommended unless you have a specific reason to); `instance_lock_port` must be a fixed non-zero port when the lock is in effect -- port `0` would let the OS hand out a different port on every bind attempt, defeating the lock, so `kuma-remote` refuses to start with that combination.
 
-Any failure in this process -- no network access, GitHub rate limiting, no matching release asset, no write permission to the install directory, a failure to spawn the replacement, and so on -- is logged and otherwise ignored; it never prevents `kuma-remote` from starting with the currently installed version.
+One consequence of the single-instance lock, when it's in use: **only one `kuma-remote` instance can run per machine at a time** -- if you need two independent sets of checks, put them all in one config file instead of running two instances.
+
+Any failure in this process -- no network access, GitHub rate limiting, no matching release asset, no write permission to the install directory, a repeated failure to spawn the replacement, and so on -- is logged and otherwise ignored; it never prevents `kuma-remote` from starting with the currently installed version. A stalled (rather than outright failed) network response can't hang this indefinitely either: the shared HTTP client has both a connect timeout and an overall request timeout.
 
 ## Modules
 
@@ -135,7 +137,7 @@ Any failure in this process -- no network access, GitHub rate limiting, no match
 - `checks/heartbeat.rs` -- Heartbeat check: always reports up, optionally pinging `host` for latency.
 - `kuma.rs` -- Uptime Kuma push client (builds the `status`/`msg`/`ping` query string, sends the GET request).
 - `logging.rs` -- `tracing` subscriber setup.
-- `updater.rs` -- checks GitHub's latest release for a newer build, self-replaces and restarts when found, and guards against duplicate instances via a single-instance lock.
+- `updater.rs` -- checks GitHub's latest release for a newer build, self-replaces and restarts when found, and guards against duplicate instances via a single-instance TCP lock with an identity handshake.
 
 ## Check Modes
 
