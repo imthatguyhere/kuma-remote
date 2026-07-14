@@ -20,11 +20,19 @@
 //! the time anyone is racing for the port, it doesn't matter which one wins
 //! -- exactly one instance of the new version ends up running either way.
 //!
-//! `service_mode` turns both of those off: no self-spawned replacement (the
-//! supervisor is trusted to restart on exit), and no single-instance lock
-//! (the supervisor is trusted to keep exactly one instance running in the
-//! first place). It exists for deployments that already have a supervisor
-//! and would rather it own the restart, full stop.
+//! Self-spawning a replacement is only safe when this process actually holds
+//! the single-instance lock (a live [`SingleInstance::Claimed`]): that's what
+//! guarantees a losing duplicate exits instead of piling up. If the lock
+//! isn't held -- `instance_lock: false`, or a claim that came back
+//! [`SingleInstance::Unavailable`] -- self-spawning would be unprotected, so
+//! `try_update` falls back to the plain exit-only path in that case too, not
+//! just under `service_mode`.
+//!
+//! `service_mode` turns both off unconditionally: no self-spawned replacement
+//! (the supervisor is trusted to restart on exit), and no single-instance
+//! lock is ever claimed in the first place (see `main.rs`). It exists for
+//! deployments that already have a supervisor and would rather it own the
+//! restart, full stop.
 //!
 //! One consequence of the single-instance lock when it *is* in use: only
 //! one kuma-remote instance can run per machine at a time. If you need two
@@ -36,21 +44,37 @@
 //! propagated -- a failed or skipped update check must never prevent
 //! kuma-remote from starting its configured checks.
 
-use std::net::TcpListener;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
-/// How many times, and how far apart, [`claim_single_instance`] retries a
-/// port bind that fails with `AddrInUse` before concluding another instance
-/// is genuinely running. Covers the brief window between an updater spawning
-/// its replacement and that replacement claiming the port for itself.
+//=-- Retry budget for a port bind that fails with `AddrInUse`, before
+//=-- concluding another instance is genuinely running. Covers the brief
+//=-- window between an updater spawning its replacement and that
+//=-- replacement claiming the port for itself.
 const CLAIM_ATTEMPTS: u32 = 10;
 const CLAIM_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+//=-- How long to wait for the identity handshake (see `LOCK_MAGIC`) when
+//=-- another process already holds the lock port.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(200);
+
+//=-- Bytes the lock holder writes back to any connection on the lock port,
+//=-- so a challenger that loses the bind race can tell "another kuma-remote
+//=-- instance holds this" apart from "some unrelated process/service
+//=-- happens to be bound to this port".
+const LOCK_MAGIC: &[u8] = b"kuma-remote-single-instance-v1";
+
+//=-- How many times, and how far apart, `try_update` retries spawning the
+//=-- replacement process before giving up and logging it as stuck.
+const SPAWN_ATTEMPTS: u32 = 3;
+const SPAWN_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 /// Outcome of [`claim_single_instance`].
 pub enum SingleInstance {
@@ -62,23 +86,29 @@ pub enum SingleInstance {
     /// any real work.
     AlreadyRunning,
     /// The lock could not be claimed for a reason unrelated to another
-    /// instance running (e.g. a local permissions/network-stack issue).
-    /// Treated as "proceed anyway, without the guarantee" -- this safety
-    /// net must never itself block kuma-remote from starting.
+    /// instance running (e.g. a local permissions/network-stack issue, or
+    /// the port being held by an unrelated process). Treated as "proceed
+    /// anyway, without the guarantee" -- this safety net must never itself
+    /// block kuma-remote from starting.
     Unavailable,
 }
 
 /// Tries to claim `port` (see `Config::instance_lock_port`) as a
-/// cross-process single-instance mutex -- nothing ever connects to it, only
-/// binding it matters. Retries briefly on `AddrInUse` (see
-/// [`CLAIM_ATTEMPTS`]) before concluding another instance is running.
+/// cross-process single-instance mutex. Retries briefly on `AddrInUse` (see
+/// [`CLAIM_ATTEMPTS`]) before concluding another instance is running. Runs
+/// blocking I/O throughout -- callers on a tokio runtime should invoke this
+/// via `tokio::task::spawn_blocking` rather than calling it directly from an
+/// async context.
 pub fn claim_single_instance(port: u16) -> SingleInstance {
     for attempt in 0..CLAIM_ATTEMPTS {
         match TcpListener::bind(("127.0.0.1", port)) {
-            Ok(listener) => return SingleInstance::Claimed(listener),
+            Ok(listener) => {
+                spawn_handshake_responder(&listener);
+                return SingleInstance::Claimed(listener);
+            }
             Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
                 if attempt + 1 == CLAIM_ATTEMPTS {
-                    return SingleInstance::AlreadyRunning;
+                    return classify_occupant(port);
                 }
                 std::thread::sleep(CLAIM_RETRY_DELAY);
             }
@@ -88,7 +118,54 @@ pub fn claim_single_instance(port: u16) -> SingleInstance {
             }
         }
     }
-    SingleInstance::AlreadyRunning
+    classify_occupant(port)
+}
+
+//=-- Spawns a detached background thread that answers every connection on
+//=-- `listener` with `LOCK_MAGIC`, so a challenger can confirm this is
+//=-- genuinely a kuma-remote instance holding the port. Runs for as long as
+//=-- `listener` (or its clone) stays open; best-effort, so a failure to
+//=-- clone just means a challenger later treats this occupant as
+//=-- unidentifiable rather than confirmed.
+fn spawn_handshake_responder(listener: &TcpListener) {
+    let responder = match listener.try_clone() {
+        Ok(responder) => responder,
+        Err(err) => {
+            warn!(error = %err, "Could not start single-instance handshake responder");
+            return;
+        }
+    };
+    std::thread::spawn(move || {
+        for mut stream in responder.incoming().flatten() {
+            let _ = stream.write_all(LOCK_MAGIC);
+        }
+    });
+}
+
+//=-- Called once the bind retries in `claim_single_instance` are exhausted:
+//=-- connects to `port` and checks for `LOCK_MAGIC` to tell a genuine
+//=-- kuma-remote instance apart from an unrelated occupant of the port.
+fn classify_occupant(port: u16) -> SingleInstance {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream = match TcpStream::connect_timeout(&addr, HANDSHAKE_TIMEOUT) {
+        Ok(stream) => stream,
+        Err(_) => return SingleInstance::Unavailable,
+    };
+    if stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT)).is_err() {
+        return SingleInstance::Unavailable;
+    }
+    let mut buf = [0u8; LOCK_MAGIC.len()];
+    match stream.read_exact(&mut buf) {
+        Ok(()) if buf == *LOCK_MAGIC => SingleInstance::AlreadyRunning,
+        _ => {
+            warn!(
+                port,
+                "instance_lock_port is held by a process that isn't kuma-remote; \
+                 proceeding without the single-instance guarantee"
+            );
+            SingleInstance::Unavailable
+        }
+    }
 }
 
 /// Subset of GitHub's release API response we care about.
@@ -112,9 +189,11 @@ struct Asset {
 /// and the running exe's file name matches a release asset with a different
 /// digest. Never fails startup: any error along the way is logged as a
 /// warning and swallowed. `instance_lock` is this process's single-instance
-/// claim (see [`SingleInstance`]), if any -- ignored entirely when
-/// `service_mode` is true. On a successful update this calls
-/// [`std::process::exit`] -- it does not return in that case.
+/// claim (see [`SingleInstance`]), if any -- self-spawning a replacement is
+/// only attempted while this is held; otherwise (including under
+/// `service_mode`) an applied update just exits and relies on a supervisor
+/// to restart it. On a successful update this calls [`std::process::exit`]
+/// -- it does not return in that case.
 pub async fn check_and_update(
     client: &Client,
     service_mode: bool,
@@ -174,7 +253,8 @@ async fn try_update(
         return Ok(());
     };
 
-    let local_bytes = std::fs::read(&exe_path)
+    let local_bytes = tokio::fs::read(&exe_path)
+        .await
         .with_context(|| format!("Reading current executable {}", exe_path.display()))?;
     let local_hash = to_hex(&Sha256::digest(&local_bytes));
 
@@ -209,33 +289,62 @@ async fn try_update(
     //=-- Written next to the running exe (not a system temp dir) so the
     //=-- subsequent rename-based replace stays on the same filesystem/volume.
     let tmp_path = exe_path.with_extension("exe.new");
-    std::fs::write(&tmp_path, &new_bytes)
+    tokio::fs::write(&tmp_path, &new_bytes)
+        .await
         .with_context(|| format!("Writing downloaded executable to {}", tmp_path.display()))?;
 
     self_replace::self_replace(&tmp_path).context("Replacing running executable")?;
-    //=-- Best-effort: self_replace has already copied the bytes into place, so
-    //=-- a leftover temp file here is harmless clutter, not a correctness issue.
-    let _ = std::fs::remove_file(&tmp_path);
+    //=-- Best-effort: self_replace has already copied the bytes into place,
+    //=-- so a leftover temp file here is harmless clutter, not a correctness
+    //=-- issue.
+    let _ = tokio::fs::remove_file(&tmp_path).await;
 
-    if service_mode {
+    //=-- Self-spawning is only safe while we actually hold the single-instance
+    //=-- lock: that's what guarantees a losing duplicate exits instead of
+    //=-- piling up. Without it -- service_mode, or a claim that came back
+    //=-- Unavailable/disabled -- fall back to exit-only and trust a
+    //=-- supervisor (if any) to restart into the already-updated binary.
+    if service_mode || instance_lock.is_none() {
+        if !service_mode {
+            warn!(
+                "Update applied on disk, but no single-instance lock is held (instance_lock \
+                 disabled or unavailable) -- skipping self-spawn to avoid risking an \
+                 unprotected duplicate instance. A process supervisor, if any, must restart \
+                 this process to pick up the update."
+            );
+        }
         info!("Update applied on disk; exiting so the process supervisor restarts into it");
         std::process::exit(0);
     }
 
     info!("Update applied, spawning replacement and exiting");
     let args: Vec<_> = std::env::args_os().skip(1).collect();
-    std::process::Command::new(&exe_path)
-        .args(&args)
-        .spawn()
-        .context("Spawning updated executable")?;
+    let mut spawn_result = std::process::Command::new(&exe_path).args(&args).spawn();
+    for _ in 1..SPAWN_ATTEMPTS {
+        if spawn_result.is_ok() {
+            break;
+        }
+        tokio::time::sleep(SPAWN_RETRY_DELAY).await;
+        spawn_result = std::process::Command::new(&exe_path).args(&args).spawn();
+    }
+    if let Err(err) = spawn_result {
+        error!(
+            error = %err,
+            "Update was applied to disk, but the replacement process failed to start after \
+             {SPAWN_ATTEMPTS} attempts -- this process will keep running its OLD in-memory \
+             code until it is manually restarted"
+        );
+        return Err(err).context("Spawning updated executable");
+    }
 
-    //=-- Only release the port once the replacement has actually been spawned:
-    //=-- if `spawn` above had failed, the `?` would have returned early and
-    //=-- this process keeps running on its current in-memory code, in which
-    //=-- case it must keep holding the lock it already holds rather than
-    //=-- leaving itself unprotected for the rest of its run. The replacement's
-    //=-- own claim attempt tolerates the brief remaining delay before this
-    //=-- process fully exits (see `CLAIM_ATTEMPTS`/`CLAIM_RETRY_DELAY`).
+    //=-- Only release the port once the replacement has actually been
+    //=-- spawned: if every spawn attempt above had failed, we would have
+    //=-- returned early and this process keeps running on its current
+    //=-- in-memory code, in which case it must keep holding the lock it
+    //=-- already holds rather than leaving itself unprotected for the rest
+    //=-- of its run. The replacement's own claim attempt tolerates the brief
+    //=-- remaining delay before this process fully exits (see
+    //=-- `CLAIM_ATTEMPTS`/`CLAIM_RETRY_DELAY`).
     instance_lock.take();
 
     std::process::exit(0);
