@@ -44,9 +44,11 @@ fn resolve_config_path(explicit: Option<PathBuf>) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_CANDIDATES[0]))
 }
 
-/// Entry point: log the app name/version/authors, load config, run the
-/// startup self-update check (if enabled), spawn one scheduler task per
-/// check, then block until Ctrl-C and abort all check tasks.
+/// Entry point: log the app name/version/authors, load config, claim the
+/// single-instance lock unless disabled (exiting immediately if another
+/// instance already holds it), run the startup self-update check (if
+/// enabled), spawn one scheduler task per check, then block until Ctrl-C and
+/// abort all check tasks.
 #[tokio::main]
 async fn main() -> Result<()> {
     logging::init();
@@ -66,6 +68,7 @@ async fn main() -> Result<()> {
     tracing::info!(
         checks = config.checks.len(),
         debug = config.debug,
+        service_mode = config.service_mode,
         "Config loaded"
     );
 
@@ -83,10 +86,28 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Some reverse proxies / WAFs (e.g. Cloudflare bot protection) block
-    // reqwest's default `reqwest/x.y.z` user agent while allowing browsers.
-    // Presenting a normal desktop-browser user agent avoids that class of
-    // false-positive block on the push URL.
+    //=-- In service_mode, a process supervisor is trusted to guarantee a
+    //=-- single running instance, so no lock is claimed at all. Otherwise,
+    //=-- claim it unless explicitly disabled via `instance_lock: false` --
+    //=-- claiming it here (not just around the updater) also guards against
+    //=-- accidental double-launches in general. See `updater.rs`.
+    let mut instance_lock = if config.service_mode || !config.instance_lock {
+        None
+    } else {
+        match updater::claim_single_instance(config.instance_lock_port) {
+            updater::SingleInstance::AlreadyRunning => {
+                tracing::warn!("Another kuma-remote instance is already running, exiting");
+                return Ok(());
+            }
+            updater::SingleInstance::Claimed(listener) => Some(listener),
+            updater::SingleInstance::Unavailable => None,
+        }
+    };
+
+    //=-- Some reverse proxies / WAFs (e.g. Cloudflare bot protection) block
+    //=-- reqwest's default `reqwest/x.y.z` user agent while allowing browsers.
+    //=-- Presenting a normal desktop-browser user agent avoids that class of
+    //=-- false-positive block on the push URL.
     let client = reqwest::Client::builder()
         .user_agent(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
@@ -96,7 +117,7 @@ async fn main() -> Result<()> {
         .context("Building HTTP client")?;
 
     if config.auto_update {
-        updater::check_and_update(&client).await;
+        updater::check_and_update(&client, config.service_mode, &mut instance_lock).await;
     }
 
     let handles = scheduler::spawn_all(
