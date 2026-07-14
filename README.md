@@ -33,6 +33,9 @@ Checks are defined in a [StrictYAML](https://hitchdev.com/strictyaml/) file. If 
 debug: false #=-- optional, defaults to false
 report_run_failures: true #=-- optional, defaults to true
 auto_update: true #=-- optional, defaults to true; checks GitHub for a newer release at startup and self-updates
+service_mode: false #=-- optional, defaults to false; true = defer restart-on-update and single-instance to a process supervisor instead of self-managing them
+instance_lock: true #=-- optional, defaults to true; ignored when service_mode is true. Set false to disable the single-instance guard
+instance_lock_port: 51247 #=-- optional, defaults to 51247; loopback port used only as a single-instance mutex, change if it collides with something else on the host
 
 checks:
   - id: self
@@ -62,6 +65,9 @@ Top-level fields:
 - `debug` -- optional, defaults to `false`. When `true`, every configured check is logged at startup, and every push logs the exact request URL sent to Kuma, including its query string. Leave this off unless you're actively troubleshooting: a push URL is itself a bearer credential (anyone who has it can push status to your monitor), so `kuma-remote` doesn't log it by default.
 - `report_run_failures` -- optional, defaults to `true`. When `true`, a check run that errors out entirely (e.g. an unresolvable hostname) is also pushed to Kuma as a `down` status with the error as `msg`, in addition to being logged. On by default: without it, a run error sends no heartbeat at all, leaving the Kuma monitor stuck on its last known state instead of reflecting the failure. Set to `false` to only log run errors and never push for them.
 - `auto_update` -- optional, defaults to `true`. See [Auto-Update](#auto-update) below.
+- `service_mode` -- optional, defaults to `false`. See [Auto-Update](#auto-update) below.
+- `instance_lock` -- optional, defaults to `true`. Ignored when `service_mode` is `true`. See [Auto-Update](#auto-update) below.
+- `instance_lock_port` -- optional, defaults to `51247`. See [Auto-Update](#auto-update) below.
 - `checks` -- the list of checks to run, described below.
 
 Fields, per entry under `checks`:
@@ -111,22 +117,25 @@ Each check's task loop is independent: a slow or failing check never blocks or d
 
 ## Auto-Update
 
-Unless `auto_update: false` is set, `kuma-remote` checks the latest GitHub release of this repo at startup, before starting any checks. It compares the SHA-256 of its own running executable (not its version number) against the digest GitHub publishes for the matching release asset. If they differ, it downloads the new executable, verifies its hash, replaces itself in place, and exits -- it does **not** relaunch itself.
+Unless `auto_update: false` is set, `kuma-remote` checks the latest GitHub release of this repo at startup, before starting any checks. It compares the SHA-256 of its own running executable (not its version number) against the digest GitHub publishes for the matching release asset. If they differ, it downloads the new executable and verifies its hash, then does one of two things depending on `service_mode`:
 
-Restarting into the new version is left entirely to whatever supervises the process, on purpose: if `kuma-remote` also spawned its own replacement, a supervisor that restarts on any exit (NSSM's default `AppExit` behavior, or a systemd unit with `Restart=always`) would restart it too, leaving both processes running permanently and double-reporting every check to Kuma. **To get an update to actually take effect automatically, run `kuma-remote` under a supervisor configured to restart it on exit** (NSSM's default settings already do this; for systemd, use `Restart=always` or `Restart=on-success`). Without such a supervisor -- e.g. running it directly in a console -- an update replaces the file on disk but the process simply stops; it needs a manual restart to pick up the new binary.
+- **`service_mode: false` (default)** -- replaces itself in place, spawns a replacement process running the new binary, and exits. The update takes effect immediately, with no supervisor (Windows service manager, systemd, ...) required. To make this safe under a supervisor that *also* restarts the process on exit (e.g. NSSM's default behavior, or a systemd unit with `Restart=always`) -- which would otherwise leave both the self-spawned replacement and the supervisor's own fresh instance running permanently, double-reporting every check -- every process claims a loopback TCP single-instance lock (`instance_lock_port`, default `51247`) before doing any real work, whether that process was self-spawned or started by a supervisor. Only one can hold it at a time; whichever loses the race just exits immediately without touching any checks. Set `instance_lock: false` to disable this guard (not recommended unless you have a specific reason to).
+- **`service_mode: true`** -- replaces itself in place and exits, full stop; no replacement process, no single-instance lock. Use this when a process supervisor is already responsible for restarting `kuma-remote` and you'd rather it own that job entirely. **Without a supervisor configured to restart on exit, an update will leave the process stopped** until something else starts it again.
 
-Any failure in this process -- no network access, GitHub rate limiting, no matching release asset, no write permission to the install directory, and so on -- is logged and otherwise ignored; it never prevents `kuma-remote` from starting with the currently installed version.
+One consequence of the single-instance lock, when it's in use (`service_mode: false` and `instance_lock: true`, the defaults): **only one `kuma-remote` instance can run per machine at a time** -- if you need two independent sets of checks, put them all in one config file instead of running two instances.
+
+Any failure in this process -- no network access, GitHub rate limiting, no matching release asset, no write permission to the install directory, a failure to spawn the replacement, and so on -- is logged and otherwise ignored; it never prevents `kuma-remote` from starting with the currently installed version.
 
 ## Modules
 
-- `main.rs` -- CLI parsing, config load, task spawning, shutdown on Ctrl-C.
+- `main.rs` -- CLI parsing, config load, single-instance claim, task spawning, shutdown on Ctrl-C.
 - `config.rs` -- StrictYAML config schema (`Config`, `CheckConfig`, `CheckMode`) and validation.
 - `scheduler.rs` -- Per-check interval loop; dispatches to the check's mode and pushes the result.
 - `checks/ping.rs` -- Ping check: single ICMP echo per run, cross-platform via the `pinger` crate.
 - `checks/heartbeat.rs` -- Heartbeat check: always reports up, optionally pinging `host` for latency.
 - `kuma.rs` -- Uptime Kuma push client (builds the `status`/`msg`/`ping` query string, sends the GET request).
 - `logging.rs` -- `tracing` subscriber setup.
-- `updater.rs` -- checks GitHub's latest release for a newer build and self-replaces/restarts when found.
+- `updater.rs` -- checks GitHub's latest release for a newer build, self-replaces and restarts when found, and guards against duplicate instances via a single-instance lock.
 
 ## Check Modes
 
