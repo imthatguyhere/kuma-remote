@@ -3,7 +3,7 @@ report_run_failures: true #=-- optional, defaults to true
 auto_update: true #=-- optional, defaults to true; checks GitHub for a newer release at startup and self-updates
 service_mode: false #=-- optional, defaults to false; true = defer restart-on-update and single-instance to a process supervisor instead of self-managing them
 instance_lock: true #=-- optional, defaults to true; ignored when service_mode is true. Set false to disable the single-instance guard
-instance_lock_port: 51247 #=-- optional, defaults to 51247; loopback port used only as a single-instance mutex, change if it collides with something else on the host
+instance_lock_port: 51247 #=-- optional, defaults to 51247; loopback port used only as a single-instance mutex, change if it collides with something else on the host. Must be non-zero when the lock is in effect (instance_lock: true and service_mode: false) -- 0 is rejected at startup
 
 checks:
   - id: self
