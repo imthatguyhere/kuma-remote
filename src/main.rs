@@ -10,6 +10,7 @@ mod scheduler;
 mod updater;
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -46,9 +47,10 @@ fn resolve_config_path(explicit: Option<PathBuf>) -> PathBuf {
 
 /// Entry point: log the app name/version/authors, load config, claim the
 /// single-instance lock unless disabled (exiting immediately if another
-/// instance already holds it), run the startup self-update check (if
-/// enabled), spawn one scheduler task per check, then block until Ctrl-C and
-/// abort all check tasks.
+/// instance already holds it, before any debug logging of check details),
+/// log every check when `config.debug` is set, run the startup self-update
+/// check (if enabled), spawn one scheduler task per check, then block until
+/// Ctrl-C and abort all check tasks.
 #[tokio::main]
 async fn main() -> Result<()> {
     logging::init();
@@ -72,6 +74,32 @@ async fn main() -> Result<()> {
         "Config loaded"
     );
 
+    //=-- In service_mode, a process supervisor is trusted to guarantee a
+    //=-- single running instance, so no lock is claimed at all. Otherwise,
+    //=-- claim it unless explicitly disabled via `instance_lock: false` --
+    //=-- claiming it here (not just around the updater) also guards against
+    //=-- accidental double-launches in general. Runs on the blocking thread
+    //=-- pool since claim_single_instance does blocking socket I/O and
+    //=-- sleeps. See `updater.rs`. Done before the debug-logging block below
+    //=-- so a duplicate instance exits without ever logging check details
+    //=-- (including push_url, a bearer credential).
+    let mut instance_lock = if config.service_mode || !config.instance_lock {
+        None
+    } else {
+        let port = config.instance_lock_port;
+        match tokio::task::spawn_blocking(move || updater::claim_single_instance(port))
+            .await
+            .context("Single-instance claim task panicked")?
+        {
+            updater::SingleInstance::AlreadyRunning => {
+                tracing::warn!("Another kuma-remote instance is already running, exiting");
+                return Ok(());
+            }
+            updater::SingleInstance::Claimed(listener) => Some(listener),
+            updater::SingleInstance::Unavailable => None,
+        }
+    };
+
     if config.debug {
         for check in &config.checks {
             tracing::info!(
@@ -86,33 +114,21 @@ async fn main() -> Result<()> {
         }
     }
 
-    //=-- In service_mode, a process supervisor is trusted to guarantee a
-    //=-- single running instance, so no lock is claimed at all. Otherwise,
-    //=-- claim it unless explicitly disabled via `instance_lock: false` --
-    //=-- claiming it here (not just around the updater) also guards against
-    //=-- accidental double-launches in general. See `updater.rs`.
-    let mut instance_lock = if config.service_mode || !config.instance_lock {
-        None
-    } else {
-        match updater::claim_single_instance(config.instance_lock_port) {
-            updater::SingleInstance::AlreadyRunning => {
-                tracing::warn!("Another kuma-remote instance is already running, exiting");
-                return Ok(());
-            }
-            updater::SingleInstance::Claimed(listener) => Some(listener),
-            updater::SingleInstance::Unavailable => None,
-        }
-    };
-
     //=-- Some reverse proxies / WAFs (e.g. Cloudflare bot protection) block
     //=-- reqwest's default `reqwest/x.y.z` user agent while allowing browsers.
     //=-- Presenting a normal desktop-browser user agent avoids that class of
-    //=-- false-positive block on the push URL.
+    //=-- false-positive block on the push URL. A blanket timeout guards
+    //=-- against a stalled response (from GitHub's API, an asset download, or
+    //=-- Kuma itself) hanging this client's callers indefinitely -- notably
+    //=-- the startup update check in updater.rs, which runs before any check
+    //=-- task is spawned.
     let client = reqwest::Client::builder()
         .user_agent(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
              (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         )
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
         .build()
         .context("Building HTTP client")?;
 
