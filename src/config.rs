@@ -30,6 +30,30 @@ pub struct Config {
     /// See `updater.rs`.
     #[serde(default = "default_auto_update")]
     pub auto_update: bool,
+    /// When true, assumes a process supervisor (a Windows service manager, a
+    /// systemd unit, ...) restarts kuma-remote on exit. An applied update
+    /// then only replaces the binary on disk and exits -- it does not spawn
+    /// a replacement itself, and it never claims the single-instance lock
+    /// (the supervisor is trusted to keep exactly one instance running).
+    /// Off by default: without a supervisor, turning this on would leave
+    /// the process stopped after an update until something else restarts
+    /// it. See `updater.rs`.
+    #[serde(default)]
+    pub service_mode: bool,
+    /// When true (default), and only when `service_mode` is false, an
+    /// update-triggered restart -- and startup in general -- claims a
+    /// single-instance lock before doing any real work, so a self-spawned
+    /// replacement and a duplicate launch (accidental, or a supervisor
+    /// restarting on top of one) never both end up running checks. Has no
+    /// effect when `service_mode` is true, since that mode never claims the
+    /// lock at all. See `updater.rs`.
+    #[serde(default = "default_instance_lock")]
+    pub instance_lock: bool,
+    /// Loopback TCP port used by the single-instance lock (see
+    /// `instance_lock`); nothing ever connects to it. Change this only if
+    /// the default collides with something else on the host.
+    #[serde(default = "default_instance_lock_port")]
+    pub instance_lock_port: u16,
     pub checks: Vec<CheckConfig>,
 }
 
@@ -41,6 +65,16 @@ fn default_report_run_failures() -> bool {
 /// Default value for [`Config::auto_update`] when absent from the config file.
 fn default_auto_update() -> bool {
     true
+}
+
+/// Default value for [`Config::instance_lock`] when absent from the config file.
+fn default_instance_lock() -> bool {
+    true
+}
+
+/// Default value for [`Config::instance_lock_port`] when absent from the config file.
+fn default_instance_lock_port() -> u16 {
+    51247
 }
 
 /// One monitored target and where to report its result.
@@ -102,6 +136,14 @@ impl Config {
                 );
                 check.push_url.truncate(query_start);
             }
+        }
+
+        if self.instance_lock_port == 0 && self.instance_lock && !self.service_mode {
+            warn!(
+                "instance_lock_port is 0, which lets the OS assign a different port on \
+                 every bind attempt -- this defeats the single-instance lock's purpose. \
+                 Set a fixed non-zero port, or disable the lock with instance_lock: false."
+            );
         }
     }
 
