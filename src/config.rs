@@ -137,21 +137,24 @@ impl Config {
                 check.push_url.truncate(query_start);
             }
         }
-
-        if self.instance_lock_port == 0 && self.instance_lock && !self.service_mode {
-            warn!(
-                "instance_lock_port is 0, which lets the OS assign a different port on \
-                 every bind attempt -- this defeats the single-instance lock's purpose. \
-                 Set a fixed non-zero port, or disable the lock with instance_lock: false."
-            );
-        }
     }
 
-    /// Reject configs that are empty, have duplicate check ids, or a
-    /// zero-length interval (which would spin the scheduler tick forever).
+    /// Reject configs that are empty, have duplicate check ids, a
+    /// zero-length interval (which would spin the scheduler tick forever), or
+    /// an `instance_lock_port` of `0` while the lock is actually in effect
+    /// (port `0` always binds to a fresh OS-assigned port, so it can never
+    /// detect a duplicate instance -- silently defeating the lock instead of
+    /// just weakening it, so this is a hard error rather than a warning).
     fn validate(&self) -> Result<()> {
         if self.checks.is_empty() {
             bail!("Config has no checks defined");
+        }
+        if self.instance_lock_port == 0 && self.instance_lock && !self.service_mode {
+            bail!(
+                "instance_lock_port is 0, which lets the OS assign a different port on \
+                 every bind attempt, defeating the single-instance lock entirely. Set a \
+                 fixed non-zero port, or disable the lock with instance_lock: false."
+            );
         }
         let mut seen_ids = HashSet::new();
         for check in &self.checks {
