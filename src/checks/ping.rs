@@ -45,9 +45,9 @@ fn ping_once_blocking(host: &str) -> Result<PingOutcome> {
 
     #[cfg(target_os = "linux")]
     {
-        // -c 1: exit after one packet. -W 2: give up waiting after 2s if
-        // the host never replies. Both flags are supported by iputils and
-        // BusyBox ping alike.
+        //=-- -c 1: exit after one packet. -W 2: give up waiting after 2s if
+        //=-- the host never replies. Both flags are supported by iputils and
+        //=-- BusyBox ping alike.
         options = options.with_raw_arguments(vec!["-c", "1", "-W", "2"]);
     }
     #[cfg(any(
@@ -58,7 +58,7 @@ fn ping_once_blocking(host: &str) -> Result<PingOutcome> {
         target_os = "dragonfly"
     ))]
     {
-        // BSD-family ping uses -t for the overall wait timeout, not TTL.
+        //=-- BSD-family ping uses -t for the overall wait timeout, not TTL.
         options = options.with_raw_arguments(vec!["-c", "1", "-t", "2"]);
     }
 
