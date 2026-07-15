@@ -32,7 +32,7 @@ pub struct Config {
     pub auto_update: bool,
     /// When true, assumes a process supervisor (a Windows service manager, a
     /// systemd unit, ...) restarts kuma-remote on exit. An applied update
-    /// then only replaces the binary on disk and exits -- it does not spawn
+    /// then only replaces the binary on disk and exits — it does not spawn
     /// a replacement itself, and it never claims the single-instance lock
     /// (the supervisor is trusted to keep exactly one instance running).
     /// Off by default: without a supervisor, turning this on would leave
@@ -41,7 +41,7 @@ pub struct Config {
     #[serde(default)]
     pub service_mode: bool,
     /// When true (default), and only when `service_mode` is false, an
-    /// update-triggered restart -- and startup in general -- claims a
+    /// update-triggered restart — and startup in general — claims a
     /// single-instance lock before doing any real work, so a self-spawned
     /// replacement and a duplicate launch (accidental, or a supervisor
     /// restarting on top of one) never both end up running checks. Has no
@@ -131,7 +131,7 @@ impl Config {
                     check_id = %check.id,
                     push_url = %check.push_url,
                     "Push_url contains a query string (likely copied from Kuma's \
-                     `?status=up&msg=OK&ping=` dashboard example) -- stripping it; \
+                     `?status=up&msg=OK&ping=` dashboard example) — stripping it; \
                      kuma-remote adds its own status/msg/ping params"
                 );
                 check.push_url.truncate(query_start);
@@ -143,7 +143,7 @@ impl Config {
     /// zero-length interval (which would spin the scheduler tick forever), or
     /// an `instance_lock_port` of `0` while the lock is actually in effect
     /// (port `0` always binds to a fresh OS-assigned port, so it can never
-    /// detect a duplicate instance -- silently defeating the lock instead of
+    /// detect a duplicate instance — silently defeating the lock instead of
     /// just weakening it, so this is a hard error rather than a warning).
     fn validate(&self) -> Result<()> {
         if self.checks.is_empty() {

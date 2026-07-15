@@ -15,7 +15,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Parser;
 
-/// Kuma Remote -- push local check results to Uptime Kuma push monitors.
+/// Kuma Remote — push local check results to Uptime Kuma push monitors.
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Cli {

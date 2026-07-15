@@ -8,23 +8,23 @@
 //!
 //! Spawning a replacement ourselves (the default) is what makes an update
 //! take effect immediately even when kuma-remote is run bare, with nothing
-//! supervising it at all -- which must keep working, since that's a normal
-//! way to run this tool. The risk that creates -- a supervisor that *also*
+//! supervising it at all — which must keep working, since that's a normal
+//! way to run this tool. The risk that creates — a supervisor that *also*
 //! restarts on exit (NSSM's default `AppExit` behavior, or a systemd unit
 //! with `Restart=always`) ending up running both the self-spawned
 //! replacement and its own fresh instance, permanently, after every update
-//! -- is closed by [`SingleInstance`]: every process, whether spawned by us
+//! — is closed by [`SingleInstance`]: every process, whether spawned by us
 //! or by a supervisor, must claim a fixed loopback port before doing any
 //! real work. Only one process can ever hold it; whichever one loses just
 //! exits immediately. Since the exe on disk is already the new version by
 //! the time anyone is racing for the port, it doesn't matter which one wins
-//! -- exactly one instance of the new version ends up running either way.
+//! — exactly one instance of the new version ends up running either way.
 //!
 //! Self-spawning a replacement is only safe when this process actually holds
 //! the single-instance lock (a live [`SingleInstance::Claimed`]): that's what
 //! guarantees a losing duplicate exits instead of piling up. If the lock
-//! isn't held -- `instance_lock: false`, or a claim that came back
-//! [`SingleInstance::Unavailable`] -- self-spawning would be unprotected, so
+//! isn't held — `instance_lock: false`, or a claim that came back
+//! [`SingleInstance::Unavailable`] — self-spawning would be unprotected, so
 //! `try_update` falls back to the plain exit-only path in that case too, not
 //! just under `service_mode`.
 //!
@@ -41,7 +41,7 @@
 //!
 //! Every failure mode here (network, rate limiting, missing digest, no
 //! matching asset, permissions, ...) is logged and swallowed rather than
-//! propagated -- a failed or skipped update check must never prevent
+//! propagated — a failed or skipped update check must never prevent
 //! kuma-remote from starting its configured checks.
 
 use std::io::{Read, Write};
@@ -93,7 +93,7 @@ const DOWNLOAD_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 //=-- Safety cap on the release asset size, checked against the response's
 //=-- `Content-Length` up front and against actual bytes received as they
 //=-- arrive (in case that header is absent or wrong). Generous headroom over
-//=-- a release binary of a few MB -- this only guards against a
+//=-- a release binary of a few MB — this only guards against a
 //=-- misconfigured or unexpectedly huge asset causing an unbounded
 //=-- in-memory allocation, not against a legitimately larger future build.
 const MAX_DOWNLOAD_SIZE: u64 = 200 * 1024 * 1024;
@@ -110,7 +110,7 @@ pub enum SingleInstance {
     /// The lock could not be claimed for a reason unrelated to another
     /// instance running (e.g. a local permissions/network-stack issue, or
     /// the port being held by an unrelated process). Treated as "proceed
-    /// anyway, without the guarantee" -- this safety net must never itself
+    /// anyway, without the guarantee" — this safety net must never itself
     /// block kuma-remote from starting.
     Unavailable,
 }
@@ -118,7 +118,7 @@ pub enum SingleInstance {
 /// Tries to claim `port` (see `Config::instance_lock_port`) as a
 /// cross-process single-instance mutex. Retries briefly on `AddrInUse` (see
 /// [`CLAIM_ATTEMPTS`]) before concluding another instance is running. Runs
-/// blocking I/O throughout -- callers on a tokio runtime should invoke this
+/// blocking I/O throughout — callers on a tokio runtime should invoke this
 /// via `tokio::task::spawn_blocking` rather than calling it directly from an
 /// async context.
 pub fn claim_single_instance(port: u16) -> SingleInstance {
@@ -207,7 +207,7 @@ struct Asset {
     browser_download_url: String,
 }
 
-/// Whether the caller -- ultimately `main` -- should continue starting
+/// Whether the caller — ultimately `main` — should continue starting
 /// checks normally, or exit immediately because an update was applied.
 /// Returned instead of calling [`std::process::exit`] directly, so the
 /// actual exit happens in `main`'s own control flow rather than being
@@ -218,7 +218,7 @@ pub enum UpdateOutcome {
     /// check failed); proceed with startup as normal.
     Continue,
     /// An update was applied on disk. Whether or not a replacement process
-    /// was spawned, this process's job is done -- the caller should stop
+    /// was spawned, this process's job is done — the caller should stop
     /// startup and return, letting the current process exit normally.
     Exit,
 }
@@ -228,7 +228,7 @@ pub enum UpdateOutcome {
 /// digest. Never fails startup: any error along the way is logged as a
 /// warning and swallowed, returning [`UpdateOutcome::Continue`].
 /// `instance_lock` is this process's single-instance claim (see
-/// [`SingleInstance`]), if any -- self-spawning a replacement is only
+/// [`SingleInstance`]), if any — self-spawning a replacement is only
 /// attempted while this is held; otherwise (including under `service_mode`)
 /// an applied update just returns [`UpdateOutcome::Exit`] and relies on a
 /// supervisor to restart it.
@@ -356,7 +356,7 @@ async fn try_update(
 
     if let Err(err) = self_replace::self_replace(&tmp_path) {
         //=-- Best-effort: nothing was applied, so the temp file is just
-        //=-- disk clutter -- clean it up before propagating the real error.
+        //=-- disk clutter — clean it up before propagating the real error.
         let _ = tokio::fs::remove_file(&tmp_path).await;
         return Err(err).context("Replacing running executable");
     }
@@ -367,14 +367,14 @@ async fn try_update(
 
     //=-- Self-spawning is only safe while we actually hold the single-instance
     //=-- lock: that's what guarantees a losing duplicate exits instead of
-    //=-- piling up. Without it -- service_mode, or a claim that came back
-    //=-- Unavailable/disabled -- fall back to exit-only and trust a
+    //=-- piling up. Without it — service_mode, or a claim that came back
+    //=-- Unavailable/disabled — fall back to exit-only and trust a
     //=-- supervisor (if any) to restart into the already-updated binary.
     if service_mode || instance_lock.is_none() {
         if !service_mode {
             warn!(
                 "Update applied on disk, but no single-instance lock is held (instance_lock \
-                 disabled or unavailable) -- skipping self-spawn to avoid risking an \
+                 disabled or unavailable) — skipping self-spawn to avoid risking an \
                  unprotected duplicate instance. A process supervisor, if any, must restart \
                  this process to pick up the update."
             );
@@ -399,7 +399,7 @@ async fn try_update(
             }
         };
         //=-- spawn() only confirms the OS accepted the launch, not that the
-        //=-- replacement is actually running -- a crash right after start
+        //=-- replacement is actually running — a crash right after start
         //=-- (e.g. antivirus briefly quarantining the just-written exe) would
         //=-- otherwise look identical to success, and this process is about
         //=-- to release the lock and exit on that belief. Give it a moment,
@@ -431,7 +431,7 @@ async fn try_update(
     let Some(_child) = child else {
         error!(
             "Update was applied to disk, but the replacement process failed to stay running \
-             after {SPAWN_ATTEMPTS} attempts -- this process will keep running its OLD in-memory \
+             after {SPAWN_ATTEMPTS} attempts — this process will keep running its OLD in-memory \
              code until it is manually restarted"
         );
         anyhow::bail!("Replacement process did not stay running after {SPAWN_ATTEMPTS} attempts");

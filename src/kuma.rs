@@ -27,7 +27,7 @@ pub enum PushStatus {
 }
 
 /// Push a check result to its configured Uptime Kuma push URL. When `debug`
-/// is set, logs the exact pushed URL, including the query string -- off by
+/// is set, logs the exact pushed URL, including the query string — off by
 /// default since a push URL is itself a bearer credential.
 pub async fn push(client: &Client, push_url: &str, status: PushStatus, debug: bool) -> Result<()> {
     let mut url = Url::parse(push_url).with_context(|| format!("Invalid push_url {push_url}"))?;
