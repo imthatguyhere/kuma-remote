@@ -134,7 +134,15 @@ async fn main() -> Result<()> {
         .context("Building HTTP client")?;
 
     if config.auto_update {
-        updater::check_and_update(&client, config.service_mode, &mut instance_lock).await;
+        let outcome =
+            updater::check_and_update(&client, config.service_mode, &mut instance_lock).await;
+        if matches!(outcome, updater::UpdateOutcome::Exit) {
+            //=-- An update was applied; this process's job is done. Returning
+            //=-- here (rather than calling std::process::exit in updater.rs)
+            //=-- keeps the exit on main's own return path, so any cleanup
+            //=-- added here in the future isn't silently skipped by it.
+            return Ok(());
+        }
     }
 
     let handles = scheduler::spawn_all(
