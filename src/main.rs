@@ -117,17 +117,18 @@ async fn main() -> Result<()> {
     //=-- Some reverse proxies / WAFs (e.g. Cloudflare bot protection) block
     //=-- reqwest's default `reqwest/x.y.z` user agent while allowing browsers.
     //=-- Presenting a normal desktop-browser user agent avoids that class of
-    //=-- false-positive block on the push URL. A blanket timeout guards
-    //=-- against a stalled response (from GitHub's API, an asset download, or
-    //=-- Kuma itself) hanging this client's callers indefinitely -- notably
-    //=-- the startup update check in updater.rs, which runs before any check
-    //=-- task is spawned.
+    //=-- false-positive block on the push URL. `connect_timeout` bounds how
+    //=-- long establishing a connection can take (GitHub's API, an asset
+    //=-- download, or Kuma itself); `timeout` additionally bounds the whole
+    //=-- request/response cycle for everything except the release-asset
+    //=-- download, which overrides it (see `updater.rs`) since that response
+    //=-- can legitimately take longer than a small API/push response would.
     let client = reqwest::Client::builder()
         .user_agent(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
              (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         )
-        .connect_timeout(Duration::from_secs(10))
+        .connect_timeout(Duration::from_secs(7))
         .timeout(Duration::from_secs(30))
         .build()
         .context("Building HTTP client")?;
