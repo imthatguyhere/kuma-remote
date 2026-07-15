@@ -46,10 +46,10 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use reqwest::Client;
+use reqwest::{Client, Response};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tracing::{error, info, warn};
@@ -62,8 +62,11 @@ const CLAIM_ATTEMPTS: u32 = 10;
 const CLAIM_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 //=-- How long to wait for the identity handshake (see `LOCK_MAGIC`) when
-//=-- another process already holds the lock port.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(200);
+//=-- another process already holds the lock port. Generous relative to the
+//=-- handshake responder's own work (writing a few dozen bytes) so a
+//=-- momentarily busy host (e.g. antivirus scanning the two exes involved in
+//=-- a self-update) doesn't misclassify a genuine occupant as unrelated.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 //=-- Bytes the lock holder writes back to any connection on the lock port,
 //=-- so a challenger that loses the bind race can tell "another kuma-remote
@@ -72,9 +75,28 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(200);
 const LOCK_MAGIC: &[u8] = b"kuma-remote-single-instance-v1";
 
 //=-- How many times, and how far apart, `try_update` retries spawning the
-//=-- replacement process before giving up and logging it as stuck.
+//=-- replacement process before giving up and logging it as stuck. Also
+//=-- doubles as the grace period given to a freshly spawned replacement
+//=-- before checking it hasn't already exited (see `try_update`).
 const SPAWN_ATTEMPTS: u32 = 3;
 const SPAWN_RETRY_DELAY: Duration = Duration::from_millis(250);
+
+//=-- Ceiling on the release-asset download itself, decoupled from the
+//=-- shared client's blanket per-request timeout (see `main.rs`) so a slow
+//=-- but still-progressing download isn't killed early; progress is instead
+//=-- logged periodically (see `DOWNLOAD_PROGRESS_INTERVAL`).
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+//=-- How often to log download progress while streaming the release asset.
+const DOWNLOAD_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
+
+//=-- Safety cap on the release asset size, checked against the response's
+//=-- `Content-Length` up front and against actual bytes received as they
+//=-- arrive (in case that header is absent or wrong). Generous headroom over
+//=-- a release binary of a few MB -- this only guards against a
+//=-- misconfigured or unexpectedly huge asset causing an unbounded
+//=-- in-memory allocation, not against a legitimately larger future build.
+const MAX_DOWNLOAD_SIZE: u64 = 200 * 1024 * 1024;
 
 /// Outcome of [`claim_single_instance`].
 pub enum SingleInstance {
@@ -200,7 +222,15 @@ pub async fn check_and_update(
     instance_lock: &mut Option<TcpListener>,
 ) {
     if let Err(err) = try_update(client, service_mode, instance_lock).await {
-        warn!(error = %err, "Auto-update check failed, continuing with current version");
+        let is_timeout = err
+            .chain()
+            .filter_map(|cause| cause.downcast_ref::<reqwest::Error>())
+            .any(reqwest::Error::is_timeout);
+        if is_timeout {
+            warn!("Update check failed: Timeout");
+        } else {
+            warn!(error = %err, "Auto-update check failed, continuing with current version");
+        }
     }
 }
 
@@ -256,7 +286,11 @@ async fn try_update(
     let local_bytes = tokio::fs::read(&exe_path)
         .await
         .with_context(|| format!("Reading current executable {}", exe_path.display()))?;
-    let local_hash = to_hex(&Sha256::digest(&local_bytes));
+    //=-- Hashing a multi-MB executable is CPU-bound; run it on a blocking
+    //=-- thread rather than stalling the async runtime worker.
+    let local_hash = tokio::task::spawn_blocking(move || to_hex(&Sha256::digest(&local_bytes)))
+        .await
+        .context("Hashing current executable panicked")?;
 
     if local_hash.eq_ignore_ascii_case(remote_hash) {
         info!("kuma-remote is up to date");
@@ -268,18 +302,25 @@ async fn try_update(
         remote_hash, "Newer kuma-remote release found, downloading"
     );
 
-    let new_bytes = client
+    let response = client
         .get(&asset.browser_download_url)
+        .timeout(DOWNLOAD_TIMEOUT)
         .send()
         .await
         .context("Downloading updated executable")?
         .error_for_status()
-        .context("Download of updated executable returned an error status")?
-        .bytes()
-        .await
-        .context("Reading downloaded executable body")?;
+        .context("Download of updated executable returned an error status")?;
 
-    let downloaded_hash = to_hex(&Sha256::digest(&new_bytes));
+    if let Some(total) = response.content_length()
+        && total > MAX_DOWNLOAD_SIZE
+    {
+        anyhow::bail!(
+            "Release asset {} is {total} bytes, exceeding the {MAX_DOWNLOAD_SIZE}-byte safety cap",
+            asset.name
+        );
+    }
+
+    let (new_bytes, downloaded_hash) = download_with_progress(response).await?;
     if !downloaded_hash.eq_ignore_ascii_case(remote_hash) {
         anyhow::bail!(
             "Downloaded executable hash {downloaded_hash} does not match published digest {remote_hash}"
@@ -293,7 +334,12 @@ async fn try_update(
         .await
         .with_context(|| format!("Writing downloaded executable to {}", tmp_path.display()))?;
 
-    self_replace::self_replace(&tmp_path).context("Replacing running executable")?;
+    if let Err(err) = self_replace::self_replace(&tmp_path) {
+        //=-- Best-effort: nothing was applied, so the temp file is just
+        //=-- disk clutter -- clean it up before propagating the real error.
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(err).context("Replacing running executable");
+    }
     //=-- Best-effort: self_replace has already copied the bytes into place,
     //=-- so a leftover temp file here is harmless clutter, not a correctness
     //=-- issue.
@@ -319,23 +365,57 @@ async fn try_update(
 
     info!("Update applied, spawning replacement and exiting");
     let args: Vec<_> = std::env::args_os().skip(1).collect();
-    let mut spawn_result = std::process::Command::new(&exe_path).args(&args).spawn();
-    for _ in 1..SPAWN_ATTEMPTS {
-        if spawn_result.is_ok() {
-            break;
-        }
+
+    let mut child = None;
+    for attempt in 1..=SPAWN_ATTEMPTS {
+        let mut candidate = match std::process::Command::new(&exe_path).args(&args).spawn() {
+            Ok(candidate) => candidate,
+            Err(err) => {
+                warn!(attempt, error = %err, "Failed to spawn replacement process, retrying");
+                if attempt < SPAWN_ATTEMPTS {
+                    tokio::time::sleep(SPAWN_RETRY_DELAY).await;
+                }
+                continue;
+            }
+        };
+        //=-- spawn() only confirms the OS accepted the launch, not that the
+        //=-- replacement is actually running -- a crash right after start
+        //=-- (e.g. antivirus briefly quarantining the just-written exe) would
+        //=-- otherwise look identical to success, and this process is about
+        //=-- to release the lock and exit on that belief. Give it a moment,
+        //=-- then confirm it hasn't already exited before trusting it.
         tokio::time::sleep(SPAWN_RETRY_DELAY).await;
-        spawn_result = std::process::Command::new(&exe_path).args(&args).spawn();
+        match candidate.try_wait() {
+            Ok(None) => {
+                child = Some(candidate);
+                break;
+            }
+            Ok(Some(status)) => {
+                warn!(
+                    attempt,
+                    %status,
+                    "Replacement process exited immediately after spawning, retrying"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    attempt,
+                    error = %err,
+                    "Could not confirm replacement process is still running, assuming it is"
+                );
+                child = Some(candidate);
+                break;
+            }
+        }
     }
-    if let Err(err) = spawn_result {
+    let Some(_child) = child else {
         error!(
-            error = %err,
-            "Update was applied to disk, but the replacement process failed to start after \
-             {SPAWN_ATTEMPTS} attempts -- this process will keep running its OLD in-memory \
+            "Update was applied to disk, but the replacement process failed to stay running \
+             after {SPAWN_ATTEMPTS} attempts -- this process will keep running its OLD in-memory \
              code until it is manually restarted"
         );
-        return Err(err).context("Spawning updated executable");
-    }
+        anyhow::bail!("Replacement process did not stay running after {SPAWN_ATTEMPTS} attempts");
+    };
 
     //=-- Only release the port once the replacement has actually been
     //=-- spawned: if every spawn attempt above had failed, we would have
@@ -348,6 +428,46 @@ async fn try_update(
     instance_lock.take();
 
     std::process::exit(0);
+}
+
+/// Streams `response`'s body to completion, hashing it incrementally (so no
+/// separate full-buffer digest pass is needed afterward) and logging
+/// progress every [`DOWNLOAD_PROGRESS_INTERVAL`] instead of blocking
+/// silently for however long the download takes. Enforces
+/// [`MAX_DOWNLOAD_SIZE`] against bytes actually received, in case
+/// `Content-Length` was absent or wrong. Returns the body bytes and their
+/// lowercase-hex SHA-256 digest.
+async fn download_with_progress(mut response: Response) -> Result<(Vec<u8>, String)> {
+    let total_len = response.content_length();
+    let mut downloaded = Vec::new();
+    let mut hasher = Sha256::new();
+    let mut last_log = Instant::now();
+
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .context("Reading downloaded executable body")?
+    {
+        downloaded.extend_from_slice(&chunk);
+        if downloaded.len() as u64 > MAX_DOWNLOAD_SIZE {
+            anyhow::bail!(
+                "Downloaded {} bytes, exceeding the {MAX_DOWNLOAD_SIZE}-byte safety cap",
+                downloaded.len()
+            );
+        }
+        hasher.update(&chunk);
+
+        if last_log.elapsed() >= DOWNLOAD_PROGRESS_INTERVAL {
+            match total_len {
+                Some(total) => info!(downloaded = downloaded.len(), total, "Downloading update"),
+                None => info!(downloaded = downloaded.len(), "Downloading update"),
+            }
+            last_log = Instant::now();
+        }
+    }
+
+    let hash = to_hex(&hasher.finalize());
+    Ok((downloaded, hash))
 }
 
 /// Lowercase-hex-encodes `bytes`, matching the format of GitHub's `digest`
