@@ -126,7 +126,7 @@ Self-spawning on its own would double-report every check if a process supervisor
 
 One consequence of the single-instance lock, when it's in use: **only one `kuma-remote` instance can run per machine at a time** -- if you need two independent sets of checks, put them all in one config file instead of running two instances.
 
-Any failure in this process -- no network access, GitHub rate limiting, no matching release asset, no write permission to the install directory, a repeated failure to spawn the replacement, and so on -- is logged and otherwise ignored; it never prevents `kuma-remote` from starting with the currently installed version. A stalled (rather than outright failed) network response can't hang this indefinitely either: the shared HTTP client has both a connect timeout and an overall request timeout.
+Any failure in this process -- no network access, GitHub rate limiting, no matching release asset, no write permission to the install directory, a repeated failure to spawn a replacement that stays running, and so on -- is logged and otherwise ignored; it never prevents `kuma-remote` from starting with the currently installed version. A connection that can't be established within 7 seconds is logged as `Update check failed: Timeout` and skipped; the release download itself has no such short deadline once connected -- it streams the asset with progress logged every 5 seconds, since a large binary over a slow link can legitimately take a while. The downloaded asset is also capped at 200 MiB as a safety net against a misconfigured or unexpectedly huge release, and after spawning a replacement process this process confirms it's still running (not just that it started) before releasing the single-instance lock and exiting.
 
 ## Modules
 
