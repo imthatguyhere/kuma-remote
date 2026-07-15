@@ -207,29 +207,49 @@ struct Asset {
     browser_download_url: String,
 }
 
+/// Whether the caller -- ultimately `main` -- should continue starting
+/// checks normally, or exit immediately because an update was applied.
+/// Returned instead of calling [`std::process::exit`] directly, so the
+/// actual exit happens in `main`'s own control flow rather than being
+/// bypassed there: any cleanup `main` gains in the future runs on this path
+/// the same as any other, since it's a normal return, not a hard exit.
+pub enum UpdateOutcome {
+    /// No update was applied (already up to date, none available, or the
+    /// check failed); proceed with startup as normal.
+    Continue,
+    /// An update was applied on disk. Whether or not a replacement process
+    /// was spawned, this process's job is done -- the caller should stop
+    /// startup and return, letting the current process exit normally.
+    Exit,
+}
+
 /// Checks for a newer release and self-updates if `client` can reach GitHub
 /// and the running exe's file name matches a release asset with a different
 /// digest. Never fails startup: any error along the way is logged as a
-/// warning and swallowed. `instance_lock` is this process's single-instance
-/// claim (see [`SingleInstance`]), if any -- self-spawning a replacement is
-/// only attempted while this is held; otherwise (including under
-/// `service_mode`) an applied update just exits and relies on a supervisor
-/// to restart it. On a successful update this calls [`std::process::exit`]
-/// -- it does not return in that case.
+/// warning and swallowed, returning [`UpdateOutcome::Continue`].
+/// `instance_lock` is this process's single-instance claim (see
+/// [`SingleInstance`]), if any -- self-spawning a replacement is only
+/// attempted while this is held; otherwise (including under `service_mode`)
+/// an applied update just returns [`UpdateOutcome::Exit`] and relies on a
+/// supervisor to restart it.
 pub async fn check_and_update(
     client: &Client,
     service_mode: bool,
     instance_lock: &mut Option<TcpListener>,
-) {
-    if let Err(err) = try_update(client, service_mode, instance_lock).await {
-        let is_timeout = err
-            .chain()
-            .filter_map(|cause| cause.downcast_ref::<reqwest::Error>())
-            .any(reqwest::Error::is_timeout);
-        if is_timeout {
-            warn!("Update check failed: Timeout");
-        } else {
-            warn!(error = %err, "Auto-update check failed, continuing with current version");
+) -> UpdateOutcome {
+    match try_update(client, service_mode, instance_lock).await {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            let is_timeout = err
+                .chain()
+                .filter_map(|cause| cause.downcast_ref::<reqwest::Error>())
+                .any(reqwest::Error::is_timeout);
+            if is_timeout {
+                warn!("Update check failed: Timeout");
+            } else {
+                warn!(error = %err, "Auto-update check failed, continuing with current version");
+            }
+            UpdateOutcome::Continue
         }
     }
 }
@@ -240,7 +260,7 @@ async fn try_update(
     client: &Client,
     service_mode: bool,
     instance_lock: &mut Option<TcpListener>,
-) -> Result<()> {
+) -> Result<UpdateOutcome> {
     let (repo_owner, repo_name) = repository_owner_and_name()?;
 
     let exe_path = std::env::current_exe().context("Locating current executable")?;
@@ -268,7 +288,7 @@ async fn try_update(
             exe_name,
             "No matching release asset for this executable, skipping update check"
         );
-        return Ok(());
+        return Ok(UpdateOutcome::Continue);
     };
 
     let Some(remote_hash) = asset
@@ -280,7 +300,7 @@ async fn try_update(
             asset = %asset.name,
             "Latest release asset has no sha256 digest, skipping update check"
         );
-        return Ok(());
+        return Ok(UpdateOutcome::Continue);
     };
 
     let local_bytes = tokio::fs::read(&exe_path)
@@ -294,7 +314,7 @@ async fn try_update(
 
     if local_hash.eq_ignore_ascii_case(remote_hash) {
         info!("kuma-remote is up to date");
-        return Ok(());
+        return Ok(UpdateOutcome::Continue);
     }
 
     info!(
@@ -360,7 +380,7 @@ async fn try_update(
             );
         }
         info!("Update applied on disk; exiting so the process supervisor restarts into it");
-        std::process::exit(0);
+        return Ok(UpdateOutcome::Exit);
     }
 
     info!("Update applied, spawning replacement and exiting");
@@ -427,7 +447,7 @@ async fn try_update(
     //=-- `CLAIM_ATTEMPTS`/`CLAIM_RETRY_DELAY`).
     instance_lock.take();
 
-    std::process::exit(0);
+    Ok(UpdateOutcome::Exit)
 }
 
 /// Streams `response`'s body to completion, hashing it incrementally (so no
