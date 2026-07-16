@@ -1,13 +1,18 @@
 debug: false #=-- optional, defaults to false
 report_run_failures: true #=-- optional, defaults to true
+auto_update: true #=-- optional, defaults to true; checks GitHub for a newer release at startup and self-updates
+service_mode: false #=-- optional, defaults to false; true = defer restart-on-update and single-instance to a process supervisor instead of self-managing them
+instance_lock: true #=-- optional, defaults to true; ignored when service_mode is true. Set false to disable the single-instance guard
+instance_lock_port: 51247 #=-- optional, defaults to 51247; loopback port used only as a single-instance mutex, change if it collides with something else on the host. Must be non-zero when the lock is in effect (instance_lock: true and service_mode: false) — 0 is rejected at startup
+slow_download_mode: false #=-- optional, defaults to false; false = update download is capped at 5 minutes total even if still progressing; true = no total cap, only aborts after a full minute with no data at all (a genuine stall). Turn on for slow/unreliable links
 
 checks:
   - id: self
     name: "Remote Agent Heartbeat"
     mode: heartbeat #=-- always reports Up with msg "Heartbeat"; host is optional
-    host: 8.8.8.8 #=-- optional -- if set, also pings and includes latency, good for pinging 8.8.8.8 — or similar — for internet latency
+    host: 8.8.8.8 #=-- optional — if set, also pings and includes latency, good for pinging 8.8.8.8 — or similar — for internet latency
     push_url: "https://kuma.mydomain.com/api/push/HbEaT456"
-    interval: 60s
+    interval: 60s #=-- It's recommended to set the heartbeat interval to at least 30 seconds longer than the longest expected check interval
     
   - id: web01
     name: "Prod Web Server"
@@ -21,4 +26,4 @@ checks:
     mode: ping
     host: db.internal.local
     push_url: "https://kuma.mydomain.com/api/push/QwErTy987"
-    interval: 5m
+    interval: 5m #=-- It's recommended to set the heartbeat interval to at least 30 seconds longer than the longest expected check interval

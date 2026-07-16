@@ -25,12 +25,69 @@ pub struct Config {
     /// last known state (or pending) instead of reflecting the failure.
     #[serde(default = "default_report_run_failures")]
     pub report_run_failures: bool,
+    /// When true (default), checks GitHub for a newer kuma-remote release at
+    /// startup and replaces this binary in place before starting any checks.
+    /// See `updater.rs`.
+    #[serde(default = "default_auto_update")]
+    pub auto_update: bool,
+    /// When true, assumes a process supervisor (a Windows service manager, a
+    /// systemd unit, ...) restarts kuma-remote on exit. An applied update
+    /// then only replaces the binary on disk and exits — it does not spawn
+    /// a replacement itself, and it never claims the single-instance lock
+    /// (the supervisor is trusted to keep exactly one instance running).
+    /// Off by default: without a supervisor, turning this on would leave
+    /// the process stopped after an update until something else restarts
+    /// it. See `updater.rs`.
+    #[serde(default)]
+    pub service_mode: bool,
+    /// When true (default), and only when `service_mode` is false, an
+    /// update-triggered restart — and startup in general — claims a
+    /// single-instance lock before doing any real work, so a self-spawned
+    /// replacement and a duplicate launch (accidental, or a supervisor
+    /// restarting on top of one) never both end up running checks. Has no
+    /// effect when `service_mode` is true, since that mode never claims the
+    /// lock at all. See `updater.rs`.
+    #[serde(default = "default_instance_lock")]
+    pub instance_lock: bool,
+    /// Loopback TCP port used by the single-instance lock (see
+    /// `instance_lock`); nothing ever connects to it. Change this only if
+    /// the default collides with something else on the host.
+    #[serde(default = "default_instance_lock_port")]
+    pub instance_lock_port: u16,
+    /// When false (default), the update-asset download is capped at a fixed
+    /// 5 minutes total, regardless of whether it's still making progress —
+    /// intended to fail fast on a connection that's technically up but
+    /// impractically slow. When true, that cap is lifted entirely and the
+    /// download instead only aborts if it goes a full minute without
+    /// receiving any data at all (a genuine stall, not just a slow
+    /// connection). Turn this on for hosts on slow or unreliable links
+    /// where a legitimate download might otherwise exceed 5 minutes; leave
+    /// it off (and disable `auto_update` instead) on a host where you'd
+    /// rather never risk running a partially-downloaded or virus-scan-stalled
+    /// update. See `updater.rs`.
+    #[serde(default)]
+    pub slow_download_mode: bool,
     pub checks: Vec<CheckConfig>,
 }
 
 /// Default value for [`Config::report_run_failures`] when absent from the config file.
 fn default_report_run_failures() -> bool {
     true
+}
+
+/// Default value for [`Config::auto_update`] when absent from the config file.
+fn default_auto_update() -> bool {
+    true
+}
+
+/// Default value for [`Config::instance_lock`] when absent from the config file.
+fn default_instance_lock() -> bool {
+    true
+}
+
+/// Default value for [`Config::instance_lock_port`] when absent from the config file.
+fn default_instance_lock_port() -> u16 {
+    51247
 }
 
 /// One monitored target and where to report its result.
@@ -87,7 +144,7 @@ impl Config {
                     check_id = %check.id,
                     push_url = %check.push_url,
                     "Push_url contains a query string (likely copied from Kuma's \
-                     `?status=up&msg=OK&ping=` dashboard example) -- stripping it; \
+                     `?status=up&msg=OK&ping=` dashboard example) — stripping it; \
                      kuma-remote adds its own status/msg/ping params"
                 );
                 check.push_url.truncate(query_start);
@@ -95,11 +152,22 @@ impl Config {
         }
     }
 
-    /// Reject configs that are empty, have duplicate check ids, or a
-    /// zero-length interval (which would spin the scheduler tick forever).
+    /// Reject configs that are empty, have duplicate check ids, a
+    /// zero-length interval (which would spin the scheduler tick forever), or
+    /// an `instance_lock_port` of `0` while the lock is actually in effect
+    /// (port `0` always binds to a fresh OS-assigned port, so it can never
+    /// detect a duplicate instance — silently defeating the lock instead of
+    /// just weakening it, so this is a hard error rather than a warning).
     fn validate(&self) -> Result<()> {
         if self.checks.is_empty() {
             bail!("Config has no checks defined");
+        }
+        if self.instance_lock_port == 0 && self.instance_lock && !self.service_mode {
+            bail!(
+                "instance_lock_port is 0, which lets the OS assign a different port on \
+                 every bind attempt, defeating the single-instance lock entirely. Set a \
+                 fixed non-zero port, or disable the lock with instance_lock: false."
+            );
         }
         let mut seen_ids = HashSet::new();
         for check in &self.checks {

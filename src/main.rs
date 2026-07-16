@@ -7,13 +7,15 @@ mod config;
 mod kuma;
 mod logging;
 mod scheduler;
+mod updater;
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 
-/// Kuma Remote -- push local check results to Uptime Kuma push monitors.
+/// Kuma Remote — push local check results to Uptime Kuma push monitors.
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Cli {
@@ -22,6 +24,13 @@ struct Cli {
     /// `config.yaml`, in that order, using the first one that exists.
     #[arg(short, long)]
     config: Option<PathBuf>,
+    /// Ask a running instance to shut down gracefully via the
+    /// single-instance lock port, then exit -- does not otherwise start
+    /// kuma-remote. Requires `instance_lock: true` and `service_mode: false`
+    /// in the config file (the same one a running instance would have
+    /// used), since that's what determines the port to connect to.
+    #[arg(long)]
+    stop: bool,
 }
 
 /// Default config file names tried, in order, when `--config` is not given.
@@ -43,22 +52,73 @@ fn resolve_config_path(explicit: Option<PathBuf>) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_CANDIDATES[0]))
 }
 
-/// Entry point: load config, spawn one scheduler task per check, then block
-/// until Ctrl-C and abort all check tasks.
+/// Entry point: log the app name/version/authors, load config. If `--stop`
+/// was given, hand off to `handle_stop` and return immediately -- nothing
+/// below this point runs. Otherwise: claim the single-instance lock unless
+/// disabled (exiting immediately if another instance already holds it,
+/// before any debug logging of check details), log every check when
+/// `config.debug` is set, run the startup self-update check (if enabled),
+/// spawn one scheduler task per check, then block until either Ctrl-C or a
+/// `--stop` request and abort all check tasks.
 #[tokio::main]
 async fn main() -> Result<()> {
     logging::init();
+
+    tracing::info!(
+        name = env!("CARGO_PKG_NAME"),
+        version = env!("CARGO_PKG_VERSION"),
+        authors = env!("CARGO_PKG_AUTHORS"),
+        "kuma-remote starting"
+    );
 
     let cli = Cli::parse();
     let config_path = resolve_config_path(cli.config);
     let config = config::Config::load(&config_path)
         .with_context(|| format!("Loading config from {}", config_path.display()))?;
 
+    if cli.stop {
+        return handle_stop(&config).await;
+    }
+
     tracing::info!(
         checks = config.checks.len(),
         debug = config.debug,
-        "Starting kuma-remote"
+        service_mode = config.service_mode,
+        "Config loaded"
     );
+
+    //=-- In service_mode, a process supervisor is trusted to guarantee a
+    //=-- single running instance, so no lock is claimed at all. Otherwise,
+    //=-- claim it unless explicitly disabled via `instance_lock: false` --
+    //=-- claiming it here (not just around the updater) also guards against
+    //=-- accidental double-launches in general. Runs on the blocking thread
+    //=-- pool since claim_single_instance does blocking socket I/O and
+    //=-- sleeps. See `updater.rs`. Done before the debug-logging block below
+    //=-- so a duplicate instance exits without ever logging check details
+    //=-- (including push_url, a bearer credential).
+    let mut lock_unavailable = false;
+    let (mut instance_lock, stop_requested) = if config.service_mode || !config.instance_lock {
+        (None, None)
+    } else {
+        let port = config.instance_lock_port;
+        match tokio::task::spawn_blocking(move || updater::claim_single_instance(port))
+            .await
+            .context("Single-instance claim task panicked")?
+        {
+            updater::SingleInstance::AlreadyRunning => {
+                tracing::warn!("Another kuma-remote instance is already running, exiting");
+                return Ok(());
+            }
+            updater::SingleInstance::Claimed {
+                lock,
+                stop_requested,
+            } => (Some(lock), Some(stop_requested)),
+            updater::SingleInstance::Unavailable => {
+                lock_unavailable = true;
+                (None, None)
+            }
+        }
+    };
 
     if config.debug {
         for check in &config.checks {
@@ -74,17 +134,43 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Some reverse proxies / WAFs (e.g. Cloudflare bot protection) block
-    // reqwest's default `reqwest/x.y.z` user agent while allowing browsers.
-    // Presenting a normal desktop-browser user agent avoids that class of
-    // false-positive block on the push URL.
+    //=-- Some reverse proxies / WAFs (e.g. Cloudflare bot protection) block
+    //=-- reqwest's default `reqwest/x.y.z` user agent while allowing browsers.
+    //=-- Presenting a normal desktop-browser user agent avoids that class of
+    //=-- false-positive block on the push URL. `connect_timeout` bounds how
+    //=-- long establishing a connection can take (GitHub's API, an asset
+    //=-- download, or Kuma itself); `timeout` additionally bounds the whole
+    //=-- request/response cycle for everything except the release-asset
+    //=-- download, which overrides it (see `updater.rs`) since that response
+    //=-- can legitimately take longer than a small API/push response would.
     let client = reqwest::Client::builder()
         .user_agent(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
              (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         )
+        .connect_timeout(Duration::from_secs(7))
+        .timeout(Duration::from_secs(30))
         .build()
         .context("Building HTTP client")?;
+
+    if config.auto_update {
+        let outcome = updater::check_and_update(
+            &client,
+            config.service_mode,
+            lock_unavailable,
+            &mut instance_lock,
+            config.slow_download_mode,
+        )
+        .await;
+        if matches!(outcome, updater::UpdateOutcome::Exit) {
+            //=-- An update was applied; this process's job is done. Returning
+            //=-- here (rather than calling std::process::exit in updater.rs)
+            //=-- keeps the exit on main's own return path, so any cleanup
+            //=-- added here in the future isn't silently skipped by it.
+            return Ok(());
+        }
+    }
+
     let handles = scheduler::spawn_all(
         config.checks,
         client,
@@ -92,14 +178,65 @@ async fn main() -> Result<()> {
         config.report_run_failures,
     );
 
-    tokio::signal::ctrl_c()
-        .await
-        .context("Waiting for ctrl-c")?;
-    tracing::info!("Shutdown signal received, exiting");
+    //=-- Races Ctrl-C against a `--stop` request (see `updater.rs`) when the
+    //=-- single-instance lock is held -- that's the only case where a
+    //=-- `--stop` client has a listener to connect to in the first place, and
+    //=-- also the only case where Ctrl-C can fail to reach this process (a
+    //=-- self-spawned replacement is a detached grandchild the shell that
+    //=-- launched the original process won't route Ctrl-C to anymore).
+    match stop_requested {
+        Some(stop_requested) => {
+            tokio::select! {
+                result = tokio::signal::ctrl_c() => {
+                    result.context("Waiting for ctrl-c")?;
+                    tracing::info!("Shutdown signal received (Ctrl-C), exiting");
+                }
+                () = stop_requested.notified() => {
+                    tracing::info!("Shutdown signal received (--stop request), exiting");
+                }
+            }
+        }
+        None => {
+            tokio::signal::ctrl_c()
+                .await
+                .context("Waiting for ctrl-c")?;
+            tracing::info!("Shutdown signal received, exiting");
+        }
+    }
 
     for handle in handles {
         handle.abort();
     }
 
     Ok(())
+}
+
+/// Handles `--stop`: asks a running instance to shut down gracefully via
+/// the single-instance lock port (see `updater::request_stop`). Does not
+/// otherwise start kuma-remote.
+async fn handle_stop(config: &config::Config) -> Result<()> {
+    if config.service_mode {
+        anyhow::bail!(
+            "service_mode is true, so no single-instance lock/control channel is in use -- \
+             stop kuma-remote through your process supervisor instead"
+        );
+    }
+    if !config.instance_lock {
+        anyhow::bail!(
+            "instance_lock is false, so there is no control channel to connect to -- stop \
+             kuma-remote via Task Manager or `Stop-Process` instead"
+        );
+    }
+    if updater::request_stop(config.instance_lock_port)
+        .await
+        .context("Requesting stop")?
+    {
+        tracing::info!("Stop request acknowledged");
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "No running kuma-remote instance found on port {} to stop",
+            config.instance_lock_port
+        )
+    }
 }

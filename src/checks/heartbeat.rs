@@ -3,7 +3,7 @@
 //! Unlike [`crate::checks::ping`], this check's purpose is to signal that
 //! the `kuma-remote` process itself is running, not to test reachability of
 //! `host`. So when `host` is given and the ping fails, the heartbeat still
-//! reports `Up` -- just without a latency figure.
+//! reports `Up` — just without a latency figure.
 
 use tracing::warn;
 
