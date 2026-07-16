@@ -265,17 +265,24 @@ fn spawn_handshake_responder(
         }
     };
     std::thread::spawn(move || {
-        for mut stream in responder.incoming().flatten() {
+        for stream_result in responder.incoming() {
             if shutdown.load(Ordering::SeqCst) {
                 break;
             }
+            let mut stream = match stream_result {
+                Ok(stream) => stream,
+                Err(err) => {
+                    warn!(error = %err, "Handshake responder failed to accept connection");
+                    continue;
+                }
+            };
             if stream.write_all(LOCK_MAGIC).is_err() {
                 continue;
             }
             if stream.set_read_timeout(Some(STOP_COMMAND_TIMEOUT)).is_err() {
                 continue;
             }
-            let mut buf = vec![0u8; STOP_COMMAND.len()];
+            let mut buf = [0u8; STOP_COMMAND.len()];
             if stream.read_exact(&mut buf).is_ok() && buf == STOP_COMMAND {
                 let _ = stream.write_all(STOP_ACK);
                 stop_requested.notify_one();
@@ -549,7 +556,15 @@ async fn try_update(
         .await
         .with_context(|| format!("Writing downloaded executable to {}", tmp_path.display()))?;
 
-    if let Err(err) = self_replace::self_replace(&tmp_path) {
+    //=-- Replacing the running executable performs synchronous filesystem
+    //=-- work, so keep it off Tokio's async runtime workers.
+    let replace_result = {
+        let tmp_path = tmp_path.clone();
+        tokio::task::spawn_blocking(move || self_replace::self_replace(&tmp_path))
+            .await
+            .context("Replacing running executable task panicked")?
+    };
+    if let Err(err) = replace_result {
         //=-- Best-effort: nothing was applied, so the temp file is just
         //=-- disk clutter — clean it up before propagating the real error.
         let _ = tokio::fs::remove_file(&tmp_path).await;
