@@ -60,6 +60,7 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -70,12 +71,20 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
 use tracing::{error, info, warn};
 
-//=-- Retry budget for a port bind that fails with `AddrInUse`, before
-//=-- concluding another instance is genuinely running. Covers the brief
-//=-- window between an updater spawning its replacement and that
-//=-- replacement claiming the port for itself.
+/// Retry budget for a port bind that fails with `AddrInUse`, before
+/// concluding another instance is genuinely running. Covers the brief
+/// window between an updater spawning its replacement and that
+/// replacement claiming the port for itself.
 const CLAIM_ATTEMPTS: u32 = 10;
 const CLAIM_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// How many times [`classify_occupant`] retries the identity handshake
+/// before concluding the occupant isn't kuma-remote. A single ambiguous
+/// read (timeout or connection error) is retried once rather than trusted
+/// immediately, since a momentarily busy genuine occupant (e.g. antivirus
+/// scanning both exes during a self-update) looks identical to an unrelated
+/// process on the first attempt.
+const OCCUPANT_CLASSIFY_ATTEMPTS: u32 = 2;
 
 /// How long to wait for the identity handshake (see `LOCK_MAGIC`) when
 /// another process already holds the lock port. Generous relative to the
@@ -114,11 +123,19 @@ const STOP_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const SPAWN_ATTEMPTS: u32 = 3;
 const SPAWN_RETRY_DELAY: Duration = Duration::from_millis(250);
 
-/// Ceiling on the release-asset download itself, decoupled from the
-/// shared client's blanket per-request timeout (see `main.rs`) so a slow
-/// but still-progressing download isn't killed early; progress is instead
-/// logged periodically (see `DOWNLOAD_PROGRESS_INTERVAL`).
-const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// Ceiling on the total time an update download may take when
+/// `Config::slow_download_mode` is off (the default), regardless of whether
+/// it's still making progress. Chosen to comfortably cover a release binary
+/// on a slow connection while still failing fast on a connection that's
+/// technically alive but impractically slow.
+const DOWNLOAD_HARD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// Ceiling on how long a single chunk read may take when
+/// `Config::slow_download_mode` is on, before the download is considered
+/// stalled and aborted. Unlike `DOWNLOAD_HARD_TIMEOUT`, this doesn't cap how
+/// long the download can run in total -- only how long it can go without
+/// any progress at all.
+const DOWNLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How often to log download progress while streaming the release asset.
 const DOWNLOAD_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
@@ -131,17 +148,43 @@ const DOWNLOAD_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 /// in-memory allocation, not against a legitimately larger future build.
 const MAX_DOWNLOAD_SIZE: u64 = 200 * 1024 * 1024;
 
+/// Owns a claimed single-instance lock: the bound `listener` and a shutdown
+/// flag shared with its handshake responder thread (see
+/// `spawn_handshake_responder`). Dropping this (including via
+/// [`Option::take`]) releases the claim: it signals the responder thread to
+/// stop and closes both its socket handle and the responder thread's cloned
+/// handle, so the OS-level port is actually freed for a replacement process
+/// to claim -- dropping only the `TcpListener` itself would leave the port
+/// bound for as long as the responder thread's clone stays open, i.e. until
+/// this whole process exits.
+pub struct InstanceLock {
+    //=-- Never read directly -- held only so its own Drop closes this
+    //=-- process's socket handle when InstanceLock is dropped.
+    #[allow(dead_code)]
+    listener: TcpListener,
+    port: u16,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        //=-- The responder thread is blocked in accept(); wake it so it
+        //=-- notices the shutdown flag and closes its cloned socket.
+        //=-- Best-effort -- if this fails, the port just stays held until
+        //=-- the process fully exits, the pre-existing behavior.
+        let _ = TcpStream::connect(("127.0.0.1", self.port));
+    }
+}
+
 /// Outcome of [`claim_single_instance`].
 pub enum SingleInstance {
-    /// This process holds the lock. Keep `listener` alive for as long as
-    /// this process should count as "the" running instance; dropping it
-    /// (including via [`Option::take`]) releases the claim immediately.
-    /// `stop_requested` is notified from the handshake responder thread the
-    /// moment a `--stop` request is validated (see [`request_stop`]); the
-    /// caller should race it against `tokio::signal::ctrl_c()` to begin a
-    /// graceful shutdown either way.
+    /// This process holds the lock. `stop_requested` is notified from the
+    /// handshake responder thread the moment a `--stop` request is
+    /// validated (see [`request_stop`]); the caller should race it against
+    /// `tokio::signal::ctrl_c()` to begin a graceful shutdown either way.
     Claimed {
-        listener: TcpListener,
+        lock: InstanceLock,
         stop_requested: Arc<Notify>,
     },
     /// Another instance already holds the lock; this process must not do
@@ -166,9 +209,18 @@ pub fn claim_single_instance(port: u16) -> SingleInstance {
         match TcpListener::bind(("127.0.0.1", port)) {
             Ok(listener) => {
                 let stop_requested = Arc::new(Notify::new());
-                spawn_handshake_responder(&listener, Arc::clone(&stop_requested));
+                let shutdown = Arc::new(AtomicBool::new(false));
+                spawn_handshake_responder(
+                    &listener,
+                    Arc::clone(&stop_requested),
+                    Arc::clone(&shutdown),
+                );
                 return SingleInstance::Claimed {
-                    listener,
+                    lock: InstanceLock {
+                        listener,
+                        port,
+                        shutdown,
+                    },
                     stop_requested,
                 };
             }
@@ -195,12 +247,16 @@ pub fn claim_single_instance(port: u16) -> SingleInstance {
 /// `STOP_ACK` and calls `stop_requested.notify_one()`. A bare identity
 /// probe that never writes anything back (like `classify_occupant`'s) just
 /// times out and moves on to the next connection, same as any other
-/// unrelated/incidental connection to this loopback port. Runs for as long
-/// as `listener` (or its clone) stays open; best-effort, so a failure to
-/// clone just means a challenger later treats this occupant as
-/// unidentifiable rather than confirmed, and `--stop` has nothing to
-/// connect to.
-fn spawn_handshake_responder(listener: &TcpListener, stop_requested: Arc<Notify>) {
+/// unrelated/incidental connection to this loopback port. Exits, closing
+/// its cloned socket, once `shutdown` is set (see [`InstanceLock::drop`]);
+/// best-effort, so a failure to clone just means a challenger later treats
+/// this occupant as unidentifiable rather than confirmed, and `--stop` has
+/// nothing to connect to.
+fn spawn_handshake_responder(
+    listener: &TcpListener,
+    stop_requested: Arc<Notify>,
+    shutdown: Arc<AtomicBool>,
+) {
     let responder = match listener.try_clone() {
         Ok(responder) => responder,
         Err(err) => {
@@ -210,6 +266,9 @@ fn spawn_handshake_responder(listener: &TcpListener, stop_requested: Arc<Notify>
     };
     std::thread::spawn(move || {
         for mut stream in responder.incoming().flatten() {
+            if shutdown.load(Ordering::SeqCst) {
+                break;
+            }
             if stream.write_all(LOCK_MAGIC).is_err() {
                 continue;
             }
@@ -228,27 +287,40 @@ fn spawn_handshake_responder(listener: &TcpListener, stop_requested: Arc<Notify>
 /// Called once the bind retries in `claim_single_instance` are exhausted:
 /// connects to `port` and checks for `LOCK_MAGIC` to tell a genuine
 /// kuma-remote instance apart from an unrelated occupant of the port.
+/// Retries an ambiguous result (connect/read timeout or error) once (see
+/// [`OCCUPANT_CLASSIFY_ATTEMPTS`]) before concluding the occupant isn't
+/// kuma-remote -- a definite mismatch (wrong bytes received) is trusted
+/// immediately, since that's not a timing issue a retry could resolve.
 fn classify_occupant(port: u16) -> SingleInstance {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    let mut stream = match TcpStream::connect_timeout(&addr, HANDSHAKE_TIMEOUT) {
-        Ok(stream) => stream,
-        Err(_) => return SingleInstance::Unavailable,
-    };
-    if stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT)).is_err() {
-        return SingleInstance::Unavailable;
-    }
-    let mut buf = [0u8; LOCK_MAGIC.len()];
-    match stream.read_exact(&mut buf) {
-        Ok(()) if buf == *LOCK_MAGIC => SingleInstance::AlreadyRunning,
-        _ => {
-            warn!(
-                port,
-                "instance_lock_port is held by a process that isn't kuma-remote; \
-                 proceeding without the single-instance guarantee"
-            );
-            SingleInstance::Unavailable
+    for attempt in 1..=OCCUPANT_CLASSIFY_ATTEMPTS {
+        let ambiguous = match TcpStream::connect_timeout(&addr, HANDSHAKE_TIMEOUT) {
+            Ok(mut stream) => {
+                if stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT)).is_err() {
+                    true
+                } else {
+                    let mut buf = [0u8; LOCK_MAGIC.len()];
+                    match stream.read_exact(&mut buf) {
+                        Ok(()) if buf == *LOCK_MAGIC => return SingleInstance::AlreadyRunning,
+                        Ok(()) => false,
+                        Err(_) => true,
+                    }
+                }
+            }
+            Err(_) => true,
+        };
+        if ambiguous && attempt < OCCUPANT_CLASSIFY_ATTEMPTS {
+            continue;
         }
+        break;
     }
+    warn!(
+        port,
+        "instance_lock_port is held by a process that didn't identify itself as kuma-remote \
+         after {OCCUPANT_CLASSIFY_ATTEMPTS} attempts; proceeding without the single-instance \
+         guarantee"
+    );
+    SingleInstance::Unavailable
 }
 
 /// Connects to `port` (see `Config::instance_lock_port`) and asks whichever
@@ -263,10 +335,16 @@ fn classify_occupant(port: u16) -> SingleInstance {
 /// (e.g. an older build without this feature, which would just drop the
 /// connection after the identity handshake).
 pub async fn request_stop(port: u16) -> Result<bool> {
-    let mut stream = match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
-        Ok(stream) => stream,
-        Err(err) if err.kind() == std::io::ErrorKind::ConnectionRefused => return Ok(false),
-        Err(err) => return Err(err).context("Connecting to running kuma-remote instance"),
+    let mut stream = match tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        tokio::net::TcpStream::connect(("127.0.0.1", port)),
+    )
+    .await
+    {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(err)) if err.kind() == std::io::ErrorKind::ConnectionRefused => return Ok(false),
+        Ok(Err(err)) => return Err(err).context("Connecting to running kuma-remote instance"),
+        Err(_) => anyhow::bail!("Timed out connecting to port {port}"),
     };
 
     let mut magic = vec![0u8; LOCK_MAGIC.len()];
@@ -333,13 +411,27 @@ pub enum UpdateOutcome {
 /// [`SingleInstance`]), if any — self-spawning a replacement is only
 /// attempted while this is held; otherwise (including under `service_mode`)
 /// an applied update just returns [`UpdateOutcome::Exit`] and relies on a
-/// supervisor to restart it.
+/// supervisor to restart it. `lock_unavailable` distinguishes an
+/// [`SingleInstance::Unavailable`] claim (an anomaly worth logging loudly)
+/// from `instance_lock` simply being `None` because `instance_lock: false`
+/// was configured deliberately. `slow_download_mode` controls how the
+/// release-asset download is bounded; see `Config::slow_download_mode`.
 pub async fn check_and_update(
     client: &Client,
     service_mode: bool,
-    instance_lock: &mut Option<TcpListener>,
+    lock_unavailable: bool,
+    instance_lock: &mut Option<InstanceLock>,
+    slow_download_mode: bool,
 ) -> UpdateOutcome {
-    match try_update(client, service_mode, instance_lock).await {
+    match try_update(
+        client,
+        service_mode,
+        lock_unavailable,
+        instance_lock,
+        slow_download_mode,
+    )
+    .await
+    {
         Ok(outcome) => outcome,
         Err(err) => {
             let is_timeout = err
@@ -361,7 +453,9 @@ pub async fn check_and_update(
 async fn try_update(
     client: &Client,
     service_mode: bool,
-    instance_lock: &mut Option<TcpListener>,
+    lock_unavailable: bool,
+    instance_lock: &mut Option<InstanceLock>,
+    slow_download_mode: bool,
 ) -> Result<UpdateOutcome> {
     let (repo_owner, repo_name) = repository_owner_and_name()?;
 
@@ -426,7 +520,6 @@ async fn try_update(
 
     let response = client
         .get(&asset.browser_download_url)
-        .timeout(DOWNLOAD_TIMEOUT)
         .send()
         .await
         .context("Downloading updated executable")?
@@ -442,7 +535,7 @@ async fn try_update(
         );
     }
 
-    let (new_bytes, downloaded_hash) = download_with_progress(response).await?;
+    let (new_bytes, downloaded_hash) = download_with_progress(response, slow_download_mode).await?;
     if !downloaded_hash.eq_ignore_ascii_case(remote_hash) {
         anyhow::bail!(
             "Downloaded executable hash {downloaded_hash} does not match published digest {remote_hash}"
@@ -473,12 +566,20 @@ async fn try_update(
     //=-- Unavailable/disabled — fall back to exit-only and trust a
     //=-- supervisor (if any) to restart into the already-updated binary.
     if service_mode || instance_lock.is_none() {
-        if !service_mode {
-            warn!(
-                "Update applied on disk, but no single-instance lock is held (instance_lock \
-                 disabled or unavailable) — skipping self-spawn to avoid risking an \
-                 unprotected duplicate instance. A process supervisor, if any, must restart \
-                 this process to pick up the update."
+        if lock_unavailable {
+            error!(
+                "Update applied on disk, but the single-instance lock could not be claimed \
+                 (instance_lock_port is held by a process that isn't kuma-remote, or the claim \
+                 attempt failed) — skipping self-spawn to avoid risking an unprotected \
+                 duplicate instance. This process will now exit, and NOTHING will restart it \
+                 unless a process supervisor is configured. Investigate what's bound to \
+                 instance_lock_port."
+            );
+        } else if !service_mode {
+            info!(
+                "Update applied on disk; instance_lock is disabled, so skipping self-spawn as \
+                 configured. A process supervisor, if any, must restart this process to pick up \
+                 the update."
             );
         }
         info!("Update applied on disk; exiting so the process supervisor restarts into it");
@@ -490,7 +591,21 @@ async fn try_update(
 
     let mut child = None;
     for attempt in 1..=SPAWN_ATTEMPTS {
-        let mut candidate = match std::process::Command::new(&exe_path).args(&args).spawn() {
+        //=-- Offloaded to a blocking thread since the underlying OS spawn
+        //=-- call (CreateProcess/exec) can stall on a busy host (e.g.
+        //=-- antivirus scanning the just-written exe), matching this file's
+        //=-- convention for other blocking work (see the hashing above and
+        //=-- `claim_single_instance`'s own doc comment).
+        let spawn_result = {
+            let exe_path = exe_path.clone();
+            let args = args.clone();
+            tokio::task::spawn_blocking(move || {
+                std::process::Command::new(&exe_path).args(&args).spawn()
+            })
+            .await
+            .context("Spawning replacement process panicked")?
+        };
+        let mut candidate = match spawn_result {
             Ok(candidate) => candidate,
             Err(err) => {
                 warn!(attempt, error = %err, "Failed to spawn replacement process, retrying");
@@ -520,13 +635,16 @@ async fn try_update(
                 );
             }
             Err(err) => {
+                //=-- Can't confirm liveness either way -- treat as failed
+                //=-- rather than assume success, since trusting a dead
+                //=-- replacement here means this process releases the lock
+                //=-- and exits, leaving nothing running at all.
                 warn!(
                     attempt,
                     error = %err,
-                    "Could not confirm replacement process is still running, assuming it is"
+                    "Could not confirm replacement process is still running, treating as \
+                     failed and retrying"
                 );
-                child = Some(candidate);
-                break;
             }
         }
     }
@@ -557,19 +675,45 @@ async fn try_update(
 /// progress every [`DOWNLOAD_PROGRESS_INTERVAL`] instead of blocking
 /// silently for however long the download takes. Enforces
 /// [`MAX_DOWNLOAD_SIZE`] against bytes actually received, in case
-/// `Content-Length` was absent or wrong. Returns the body bytes and their
-/// lowercase-hex SHA-256 digest.
-async fn download_with_progress(mut response: Response) -> Result<(Vec<u8>, String)> {
+/// `Content-Length` was absent or wrong. When `slow_download_mode` is off
+/// (the default), the whole download is capped at
+/// [`DOWNLOAD_HARD_TIMEOUT`] regardless of progress; when it's on, there is
+/// no overall cap, only a per-chunk [`DOWNLOAD_STALL_TIMEOUT`] so a
+/// download that's genuinely stuck (as opposed to just slow) still gets
+/// aborted. Returns the body bytes and their lowercase-hex SHA-256 digest.
+async fn download_with_progress(
+    mut response: Response,
+    slow_download_mode: bool,
+) -> Result<(Vec<u8>, String)> {
     let total_len = response.content_length();
     let mut downloaded = Vec::new();
     let mut hasher = Sha256::new();
     let mut last_log = Instant::now();
+    let start = Instant::now();
 
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .context("Reading downloaded executable body")?
-    {
+    loop {
+        let next_chunk_timeout = if slow_download_mode {
+            DOWNLOAD_STALL_TIMEOUT
+        } else {
+            DOWNLOAD_HARD_TIMEOUT.saturating_sub(start.elapsed())
+        };
+        let Ok(chunk) = tokio::time::timeout(next_chunk_timeout, response.chunk()).await else {
+            if slow_download_mode {
+                anyhow::bail!(
+                    "Download stalled: no data received for {}s",
+                    DOWNLOAD_STALL_TIMEOUT.as_secs()
+                );
+            } else {
+                anyhow::bail!(
+                    "Download exceeded the {}-second cap (slow_download_mode is disabled)",
+                    DOWNLOAD_HARD_TIMEOUT.as_secs()
+                );
+            }
+        };
+        let Some(chunk) = chunk.context("Reading downloaded executable body")? else {
+            break;
+        };
+
         downloaded.extend_from_slice(&chunk);
         if downloaded.len() as u64 > MAX_DOWNLOAD_SIZE {
             anyhow::bail!(
