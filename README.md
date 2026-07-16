@@ -107,14 +107,13 @@ Ctrl-C reliably stops whichever instance you directly launched, but not necessar
 
 ## Architecture
 
-```text
-config.yaml --> Config::load (StrictYAML) --> scheduler::spawn_all
-                                                     |
-                                     one tokio task per check, own interval
-                                                     |
-                                          checks::<mode>::run (e.g. ping)
-                                                     |
-                                            kuma::push (GET push_url)
+```mermaid
+flowchart TD
+    A["kuma-config.yaml"] --> B["Config::load (StrictYAML)"]
+    B --> C["scheduler::spawn_all"]
+    C --> D["One tokio task per check, its own interval"]
+    D --> E["checks::&lt;mode&gt;::run (e.g. ping)"]
+    E --> F["kuma::push (GET push_url)"]
 ```
 
 Each check's task loop is independent: a slow or failing check never blocks or delays any other check's schedule.
