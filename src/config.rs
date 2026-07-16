@@ -54,6 +54,19 @@ pub struct Config {
     /// the default collides with something else on the host.
     #[serde(default = "default_instance_lock_port")]
     pub instance_lock_port: u16,
+    /// When false (default), the update-asset download is capped at a fixed
+    /// 5 minutes total, regardless of whether it's still making progress —
+    /// intended to fail fast on a connection that's technically up but
+    /// impractically slow. When true, that cap is lifted entirely and the
+    /// download instead only aborts if it goes a full minute without
+    /// receiving any data at all (a genuine stall, not just a slow
+    /// connection). Turn this on for hosts on slow or unreliable links
+    /// where a legitimate download might otherwise exceed 5 minutes; leave
+    /// it off (and disable `auto_update` instead) on a host where you'd
+    /// rather never risk running a partially-downloaded or virus-scan-stalled
+    /// update. See `updater.rs`.
+    #[serde(default)]
+    pub slow_download_mode: bool,
     pub checks: Vec<CheckConfig>,
 }
 
