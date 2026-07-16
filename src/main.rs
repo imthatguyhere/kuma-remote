@@ -96,6 +96,7 @@ async fn main() -> Result<()> {
     //=-- sleeps. See `updater.rs`. Done before the debug-logging block below
     //=-- so a duplicate instance exits without ever logging check details
     //=-- (including push_url, a bearer credential).
+    let mut lock_unavailable = false;
     let (mut instance_lock, stop_requested) = if config.service_mode || !config.instance_lock {
         (None, None)
     } else {
@@ -109,10 +110,13 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             updater::SingleInstance::Claimed {
-                listener,
+                lock,
                 stop_requested,
-            } => (Some(listener), Some(stop_requested)),
-            updater::SingleInstance::Unavailable => (None, None),
+            } => (Some(lock), Some(stop_requested)),
+            updater::SingleInstance::Unavailable => {
+                lock_unavailable = true;
+                (None, None)
+            }
         }
     };
 
@@ -150,8 +154,14 @@ async fn main() -> Result<()> {
         .context("Building HTTP client")?;
 
     if config.auto_update {
-        let outcome =
-            updater::check_and_update(&client, config.service_mode, &mut instance_lock).await;
+        let outcome = updater::check_and_update(
+            &client,
+            config.service_mode,
+            lock_unavailable,
+            &mut instance_lock,
+            config.slow_download_mode,
+        )
+        .await;
         if matches!(outcome, updater::UpdateOutcome::Exit) {
             //=-- An update was applied; this process's job is done. Returning
             //=-- here (rather than calling std::process::exit in updater.rs)
