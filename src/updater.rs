@@ -39,6 +39,19 @@
 //! independent sets of checks, list them all in one config file rather than
 //! running two instances.
 //!
+//! The lock port also doubles as a tiny graceful-shutdown channel, since a
+//! self-spawned replacement is a detached process a terminal's Ctrl-C can no
+//! longer reliably reach once the original foreground process has exited
+//! (it's no longer the shell's tracked job, even though it's still attached
+//! to the same console). `kuma-remote --stop` ([`request_stop`]) connects to
+//! the lock port and asks whichever instance holds it to shut down; the
+//! handshake responder spawned by [`claim_single_instance`] recognizes the
+//! request and notifies `main`'s shutdown wait, the same one Ctrl-C also
+//! feeds into. Only meaningful when the lock is actually in use -- under
+//! `service_mode`, or with `instance_lock: false`, there's no listener to
+//! connect to, and Ctrl-C already works reliably anyway since nothing is
+//! ever self-spawned in either of those cases.
+//!
 //! Every failure mode here (network, rate limiting, missing digest, no
 //! matching asset, permissions, ...) is logged and swallowed rather than
 //! propagated — a failed or skipped update check must never prevent
@@ -46,12 +59,15 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use reqwest::{Client, Response};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Notify;
 use tracing::{error, info, warn};
 
 //=-- Retry budget for a port bind that fails with `AddrInUse`, before
@@ -73,6 +89,23 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 //=-- instance holds this" apart from "some unrelated process/service
 //=-- happens to be bound to this port".
 const LOCK_MAGIC: &[u8] = b"kuma-remote-single-instance-v1";
+
+//=-- Exact bytes `request_stop` sends, and the handshake responder requires
+//=-- an exact match on, after the identity handshake (`LOCK_MAGIC`) and
+//=-- before treating an inbound connection as a genuine shutdown request
+//=-- rather than an incidental local connection -- e.g. `classify_occupant`'s
+//=-- own probe, which reads `LOCK_MAGIC` and disconnects without writing
+//=-- anything back.
+const STOP_COMMAND: &[u8] = b"kuma-remote-stop-v1\n";
+//=-- Bytes the handshake responder writes back once `STOP_COMMAND` is
+//=-- matched, confirming to `request_stop` that a shutdown was actually
+//=-- triggered rather than the connection just being dropped.
+const STOP_ACK: &[u8] = b"kuma-remote-stopping-v1\n";
+//=-- How long the handshake responder waits, after writing `LOCK_MAGIC`, for
+//=-- the connecting side to send `STOP_COMMAND` before giving up and closing
+//=-- the connection. Also the budget `request_stop` allows for the
+//=-- acknowledgement that follows.
+const STOP_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 
 //=-- How many times, and how far apart, `try_update` retries spawning the
 //=-- replacement process before giving up and logging it as stuck. Also
@@ -100,10 +133,17 @@ const MAX_DOWNLOAD_SIZE: u64 = 200 * 1024 * 1024;
 
 /// Outcome of [`claim_single_instance`].
 pub enum SingleInstance {
-    /// This process holds the lock. Keep the listener alive for as long as
+    /// This process holds the lock. Keep `listener` alive for as long as
     /// this process should count as "the" running instance; dropping it
     /// (including via [`Option::take`]) releases the claim immediately.
-    Claimed(TcpListener),
+    /// `stop_requested` is notified from the handshake responder thread the
+    /// moment a `--stop` request is validated (see [`request_stop`]); the
+    /// caller should race it against `tokio::signal::ctrl_c()` to begin a
+    /// graceful shutdown either way.
+    Claimed {
+        listener: TcpListener,
+        stop_requested: Arc<Notify>,
+    },
     /// Another instance already holds the lock; this process must not do
     /// any real work.
     AlreadyRunning,
@@ -125,8 +165,12 @@ pub fn claim_single_instance(port: u16) -> SingleInstance {
     for attempt in 0..CLAIM_ATTEMPTS {
         match TcpListener::bind(("127.0.0.1", port)) {
             Ok(listener) => {
-                spawn_handshake_responder(&listener);
-                return SingleInstance::Claimed(listener);
+                let stop_requested = Arc::new(Notify::new());
+                spawn_handshake_responder(&listener, Arc::clone(&stop_requested));
+                return SingleInstance::Claimed {
+                    listener,
+                    stop_requested,
+                };
             }
             Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
                 if attempt + 1 == CLAIM_ATTEMPTS {
@@ -143,13 +187,20 @@ pub fn claim_single_instance(port: u16) -> SingleInstance {
     classify_occupant(port)
 }
 
-//=-- Spawns a detached background thread that answers every connection on
-//=-- `listener` with `LOCK_MAGIC`, so a challenger can confirm this is
-//=-- genuinely a kuma-remote instance holding the port. Runs for as long as
-//=-- `listener` (or its clone) stays open; best-effort, so a failure to
+//=-- Spawns a detached background thread that, for every connection on
+//=-- `listener`: (1) writes `LOCK_MAGIC`, so a challenger (`classify_occupant`
+//=-- or `request_stop`) can confirm this is genuinely a kuma-remote instance
+//=-- holding the port, then (2) waits up to `STOP_COMMAND_TIMEOUT` for the
+//=-- connecting side to send `STOP_COMMAND` in reply -- if it does, writes
+//=-- `STOP_ACK` and calls `stop_requested.notify_one()`. A bare identity
+//=-- probe that never writes anything back (like `classify_occupant`'s) just
+//=-- times out and moves on to the next connection, same as any other
+//=-- unrelated/incidental connection to this loopback port. Runs for as long
+//=-- as `listener` (or its clone) stays open; best-effort, so a failure to
 //=-- clone just means a challenger later treats this occupant as
-//=-- unidentifiable rather than confirmed.
-fn spawn_handshake_responder(listener: &TcpListener) {
+//=-- unidentifiable rather than confirmed, and `--stop` has nothing to
+//=-- connect to.
+fn spawn_handshake_responder(listener: &TcpListener, stop_requested: Arc<Notify>) {
     let responder = match listener.try_clone() {
         Ok(responder) => responder,
         Err(err) => {
@@ -159,7 +210,17 @@ fn spawn_handshake_responder(listener: &TcpListener) {
     };
     std::thread::spawn(move || {
         for mut stream in responder.incoming().flatten() {
-            let _ = stream.write_all(LOCK_MAGIC);
+            if stream.write_all(LOCK_MAGIC).is_err() {
+                continue;
+            }
+            if stream.set_read_timeout(Some(STOP_COMMAND_TIMEOUT)).is_err() {
+                continue;
+            }
+            let mut buf = vec![0u8; STOP_COMMAND.len()];
+            if stream.read_exact(&mut buf).is_ok() && buf == STOP_COMMAND {
+                let _ = stream.write_all(STOP_ACK);
+                stop_requested.notify_one();
+            }
         }
     });
 }
@@ -188,6 +249,47 @@ fn classify_occupant(port: u16) -> SingleInstance {
             SingleInstance::Unavailable
         }
     }
+}
+
+/// Connects to `port` (see `Config::instance_lock_port`) and asks whichever
+/// process holds it to shut down gracefully. Checks the occupant's identity
+/// the same way `classify_occupant` does (via [`LOCK_MAGIC`]) before ever
+/// sending [`STOP_COMMAND`], so this can't be pointed at an unrelated
+/// process that happens to be listening on that port. Returns `Ok(true)` if
+/// a kuma-remote instance acknowledged the request, `Ok(false)` if nothing
+/// is listening on `port` at all (no running instance to stop), or `Err`
+/// for any other connection/protocol failure -- including the occupant not
+/// being a kuma-remote instance, or one that didn't acknowledge in time
+/// (e.g. an older build without this feature, which would just drop the
+/// connection after the identity handshake).
+pub async fn request_stop(port: u16) -> Result<bool> {
+    let mut stream = match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+        Ok(stream) => stream,
+        Err(err) if err.kind() == std::io::ErrorKind::ConnectionRefused => return Ok(false),
+        Err(err) => return Err(err).context("Connecting to running kuma-remote instance"),
+    };
+
+    let mut magic = vec![0u8; LOCK_MAGIC.len()];
+    tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.read_exact(&mut magic))
+        .await
+        .context("Timed out waiting for instance identity handshake")?
+        .context("Reading instance identity handshake")?;
+    if magic != LOCK_MAGIC {
+        anyhow::bail!("Port {port} is held by a process that isn't kuma-remote");
+    }
+
+    stream
+        .write_all(STOP_COMMAND)
+        .await
+        .context("Sending stop request")?;
+
+    let mut ack = vec![0u8; STOP_ACK.len()];
+    tokio::time::timeout(STOP_COMMAND_TIMEOUT, stream.read_exact(&mut ack))
+        .await
+        .context("Timed out waiting for stop acknowledgement")?
+        .context("Reading stop acknowledgement")?;
+
+    Ok(ack == STOP_ACK)
 }
 
 /// Subset of GitHub's release API response we care about.
