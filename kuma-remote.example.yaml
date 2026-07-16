@@ -11,7 +11,7 @@ checks:
     mode: heartbeat #=-- always reports Up with msg "Heartbeat"; host is optional
     host: 8.8.8.8 #=-- optional — if set, also pings and includes latency, good for pinging 8.8.8.8 — or similar — for internet latency
     push_url: "https://kuma.mydomain.com/api/push/HbEaT456"
-    interval: 60s
+    interval: 60s #=-- It's recommended to set the heartbeat interval to at least 30 seconds longer than the longest expected check interval
     
   - id: web01
     name: "Prod Web Server"
@@ -25,4 +25,4 @@ checks:
     mode: ping
     host: db.internal.local
     push_url: "https://kuma.mydomain.com/api/push/QwErTy987"
-    interval: 5m
+    interval: 5m #=-- It's recommended to set the heartbeat interval to at least 30 seconds longer than the longest expected check interval
