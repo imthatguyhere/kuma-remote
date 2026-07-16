@@ -89,13 +89,17 @@ The config file must define at least one check; a zero-length `interval`, a dupl
 
 ```sh
 kuma-remote [--config <path>]
+kuma-remote --stop [--config <path>]
 ```
 
 - `-c`, `--config <path>` — Path to the StrictYAML config file. Default: first of `kuma-remote.yaml`, `kuma-config.yaml`, `config.yaml` (checked in that order) that exists.
+- `--stop` — Asks a running instance to shut down gracefully, then exits immediately; does not otherwise start `kuma-remote`. Requires `--config` (or the default lookup) to resolve to the *same* config a running instance is using, since that's what determines the port to connect to. Only works when the single-instance lock is in use (`service_mode: false` and `instance_lock: true`, the defaults) — see [Auto-Update](#auto-update).
 - `-h`, `--help` — Print help.
 - `-V`, `--version` — Print version.
 
-`kuma-remote` has one mode of operation: it loads the config, starts one background task per check, and runs until interrupted (Ctrl-C / SIGINT), at which point all check tasks stop and the process exits. There is no one-shot/run-once flag; scheduling is handled internally, not by an external cron/Task Scheduler. To run continuously across reboots, wrap it in a Windows service or a systemd unit.
+`kuma-remote` has one mode of operation: it loads the config, starts one background task per check, and runs until interrupted (Ctrl-C / SIGINT, or a `--stop` request), at which point all check tasks stop and the process exits. There is no one-shot/run-once flag; scheduling is handled internally, not by an external cron/Task Scheduler. To run continuously across reboots, wrap it in a Windows service or a systemd unit.
+
+Ctrl-C reliably stops whichever instance you directly launched, but not necessarily one that's the result of a self-triggered update: the replacement process spawned after an update (see [Auto-Update](#auto-update)) is a detached process your shell never launched, so that same terminal's Ctrl-C may not reach it even though it's still attached to the same console. `--stop` works regardless, since it targets whichever process currently holds the single-instance lock rather than relying on the shell to forward a signal to the right process.
 
 ## Output
 
@@ -126,18 +130,20 @@ Self-spawning on its own would double-report every check if a process supervisor
 
 One consequence of the single-instance lock, when it's in use: **only one `kuma-remote` instance can run per machine at a time** — if you need two independent sets of checks, put them all in one config file instead of running two instances.
 
+The same lock port doubles as a graceful-shutdown channel: `kuma-remote --stop` connects to it and asks whichever instance holds it to shut down, which is the reliable way to stop an instance that's the result of a self-triggered update (see [Usage](#usage) above for why plain Ctrl-C can't always reach it).
+
 Any failure in this process — no network access, GitHub rate limiting, no matching release asset, no write permission to the install directory, a repeated failure to spawn a replacement that stays running, and so on — is logged and otherwise ignored; it never prevents `kuma-remote` from starting with the currently installed version. A connection that can't be established within 7 seconds is logged as `Update check failed: Timeout` and skipped; the release download itself has no such short deadline once connected — it streams the asset with progress logged every 5 seconds, since a large binary over a slow link can legitimately take a while. The downloaded asset is also capped at 200 MiB as a safety net against a misconfigured or unexpectedly huge release, and after spawning a replacement process this process confirms it's still running (not just that it started) before releasing the single-instance lock and exiting.
 
 ## Modules
 
-- `main.rs` — CLI parsing, config load, single-instance claim, task spawning, shutdown on Ctrl-C.
+- `main.rs` — CLI parsing (including `--stop`), config load, single-instance claim, task spawning, shutdown on Ctrl-C or a `--stop` request.
 - `config.rs` — StrictYAML config schema (`Config`, `CheckConfig`, `CheckMode`) and validation.
 - `scheduler.rs` — Per-check interval loop; dispatches to the check's mode and pushes the result.
 - `checks/ping.rs` — Ping check: single ICMP echo per run, cross-platform via the `pinger` crate.
 - `checks/heartbeat.rs` — Heartbeat check: always reports up, optionally pinging `host` for latency.
 - `kuma.rs` — Uptime Kuma push client (builds the `status`/`msg`/`ping` query string, sends the GET request).
 - `logging.rs` — `tracing` subscriber setup.
-- `updater.rs` — checks GitHub's latest release for a newer build, self-replaces and restarts when found, and guards against duplicate instances via a single-instance TCP lock with an identity handshake.
+- `updater.rs` — checks GitHub's latest release for a newer build, self-replaces and restarts when found, guards against duplicate instances via a single-instance TCP lock with an identity handshake, and serves `--stop` requests on that same port.
 
 ## Check Modes
 
