@@ -77,58 +77,58 @@ use tracing::{error, info, warn};
 const CLAIM_ATTEMPTS: u32 = 10;
 const CLAIM_RETRY_DELAY: Duration = Duration::from_millis(100);
 
-//=-- How long to wait for the identity handshake (see `LOCK_MAGIC`) when
-//=-- another process already holds the lock port. Generous relative to the
-//=-- handshake responder's own work (writing a few dozen bytes) so a
-//=-- momentarily busy host (e.g. antivirus scanning the two exes involved in
-//=-- a self-update) doesn't misclassify a genuine occupant as unrelated.
+/// How long to wait for the identity handshake (see `LOCK_MAGIC`) when
+/// another process already holds the lock port. Generous relative to the
+/// handshake responder's own work (writing a few dozen bytes) so a
+/// momentarily busy host (e.g. antivirus scanning the two exes involved in
+/// a self-update) doesn't misclassify a genuine occupant as unrelated.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
-//=-- Bytes the lock holder writes back to any connection on the lock port,
-//=-- so a challenger that loses the bind race can tell "another kuma-remote
-//=-- instance holds this" apart from "some unrelated process/service
-//=-- happens to be bound to this port".
+/// Bytes the lock holder writes back to any connection on the lock port,
+/// so a challenger that loses the bind race can tell "another kuma-remote
+/// instance holds this" apart from "some unrelated process/service
+/// happens to be bound to this port".
 const LOCK_MAGIC: &[u8] = b"kuma-remote-single-instance-v1";
 
-//=-- Exact bytes `request_stop` sends, and the handshake responder requires
-//=-- an exact match on, after the identity handshake (`LOCK_MAGIC`) and
-//=-- before treating an inbound connection as a genuine shutdown request
-//=-- rather than an incidental local connection -- e.g. `classify_occupant`'s
-//=-- own probe, which reads `LOCK_MAGIC` and disconnects without writing
-//=-- anything back.
+/// Exact bytes `request_stop` sends, and the handshake responder requires
+/// an exact match on, after the identity handshake (`LOCK_MAGIC`) and
+/// before treating an inbound connection as a genuine shutdown request
+/// rather than an incidental local connection -- e.g. `classify_occupant`'s
+/// own probe, which reads `LOCK_MAGIC` and disconnects without writing
+/// anything back.
 const STOP_COMMAND: &[u8] = b"kuma-remote-stop-v1\n";
-//=-- Bytes the handshake responder writes back once `STOP_COMMAND` is
-//=-- matched, confirming to `request_stop` that a shutdown was actually
-//=-- triggered rather than the connection just being dropped.
+/// Bytes the handshake responder writes back once `STOP_COMMAND` is
+/// matched, confirming to `request_stop` that a shutdown was actually
+/// triggered rather than the connection just being dropped.
 const STOP_ACK: &[u8] = b"kuma-remote-stopping-v1\n";
-//=-- How long the handshake responder waits, after writing `LOCK_MAGIC`, for
-//=-- the connecting side to send `STOP_COMMAND` before giving up and closing
-//=-- the connection. Also the budget `request_stop` allows for the
-//=-- acknowledgement that follows.
+/// How long the handshake responder waits, after writing `LOCK_MAGIC`, for
+/// the connecting side to send `STOP_COMMAND` before giving up and closing
+/// the connection. Also the budget `request_stop` allows for the
+/// acknowledgement that follows.
 const STOP_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 
-//=-- How many times, and how far apart, `try_update` retries spawning the
-//=-- replacement process before giving up and logging it as stuck. Also
-//=-- doubles as the grace period given to a freshly spawned replacement
-//=-- before checking it hasn't already exited (see `try_update`).
+/// How many times, and how far apart, `try_update` retries spawning the
+/// replacement process before giving up and logging it as stuck. Also
+/// doubles as the grace period given to a freshly spawned replacement
+/// before checking it hasn't already exited (see `try_update`).
 const SPAWN_ATTEMPTS: u32 = 3;
 const SPAWN_RETRY_DELAY: Duration = Duration::from_millis(250);
 
-//=-- Ceiling on the release-asset download itself, decoupled from the
-//=-- shared client's blanket per-request timeout (see `main.rs`) so a slow
-//=-- but still-progressing download isn't killed early; progress is instead
-//=-- logged periodically (see `DOWNLOAD_PROGRESS_INTERVAL`).
+/// Ceiling on the release-asset download itself, decoupled from the
+/// shared client's blanket per-request timeout (see `main.rs`) so a slow
+/// but still-progressing download isn't killed early; progress is instead
+/// logged periodically (see `DOWNLOAD_PROGRESS_INTERVAL`).
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
-//=-- How often to log download progress while streaming the release asset.
+/// How often to log download progress while streaming the release asset.
 const DOWNLOAD_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 
-//=-- Safety cap on the release asset size, checked against the response's
-//=-- `Content-Length` up front and against actual bytes received as they
-//=-- arrive (in case that header is absent or wrong). Generous headroom over
-//=-- a release binary of a few MB — this only guards against a
-//=-- misconfigured or unexpectedly huge asset causing an unbounded
-//=-- in-memory allocation, not against a legitimately larger future build.
+/// Safety cap on the release asset size, checked against the response's
+/// `Content-Length` up front and against actual bytes received as they
+/// arrive (in case that header is absent or wrong). Generous headroom over
+/// a release binary of a few MB — this only guards against a
+/// misconfigured or unexpectedly huge asset causing an unbounded
+/// in-memory allocation, not against a legitimately larger future build.
 const MAX_DOWNLOAD_SIZE: u64 = 200 * 1024 * 1024;
 
 /// Outcome of [`claim_single_instance`].
@@ -187,19 +187,19 @@ pub fn claim_single_instance(port: u16) -> SingleInstance {
     classify_occupant(port)
 }
 
-//=-- Spawns a detached background thread that, for every connection on
-//=-- `listener`: (1) writes `LOCK_MAGIC`, so a challenger (`classify_occupant`
-//=-- or `request_stop`) can confirm this is genuinely a kuma-remote instance
-//=-- holding the port, then (2) waits up to `STOP_COMMAND_TIMEOUT` for the
-//=-- connecting side to send `STOP_COMMAND` in reply -- if it does, writes
-//=-- `STOP_ACK` and calls `stop_requested.notify_one()`. A bare identity
-//=-- probe that never writes anything back (like `classify_occupant`'s) just
-//=-- times out and moves on to the next connection, same as any other
-//=-- unrelated/incidental connection to this loopback port. Runs for as long
-//=-- as `listener` (or its clone) stays open; best-effort, so a failure to
-//=-- clone just means a challenger later treats this occupant as
-//=-- unidentifiable rather than confirmed, and `--stop` has nothing to
-//=-- connect to.
+/// Spawns a detached background thread that, for every connection on
+/// `listener`: (1) writes `LOCK_MAGIC`, so a challenger (`classify_occupant`
+/// or `request_stop`) can confirm this is genuinely a kuma-remote instance
+/// holding the port, then (2) waits up to `STOP_COMMAND_TIMEOUT` for the
+/// connecting side to send `STOP_COMMAND` in reply -- if it does, writes
+/// `STOP_ACK` and calls `stop_requested.notify_one()`. A bare identity
+/// probe that never writes anything back (like `classify_occupant`'s) just
+/// times out and moves on to the next connection, same as any other
+/// unrelated/incidental connection to this loopback port. Runs for as long
+/// as `listener` (or its clone) stays open; best-effort, so a failure to
+/// clone just means a challenger later treats this occupant as
+/// unidentifiable rather than confirmed, and `--stop` has nothing to
+/// connect to.
 fn spawn_handshake_responder(listener: &TcpListener, stop_requested: Arc<Notify>) {
     let responder = match listener.try_clone() {
         Ok(responder) => responder,
@@ -225,9 +225,9 @@ fn spawn_handshake_responder(listener: &TcpListener, stop_requested: Arc<Notify>
     });
 }
 
-//=-- Called once the bind retries in `claim_single_instance` are exhausted:
-//=-- connects to `port` and checks for `LOCK_MAGIC` to tell a genuine
-//=-- kuma-remote instance apart from an unrelated occupant of the port.
+/// Called once the bind retries in `claim_single_instance` are exhausted:
+/// connects to `port` and checks for `LOCK_MAGIC` to tell a genuine
+/// kuma-remote instance apart from an unrelated occupant of the port.
 fn classify_occupant(port: u16) -> SingleInstance {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let mut stream = match TcpStream::connect_timeout(&addr, HANDSHAKE_TIMEOUT) {
