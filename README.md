@@ -111,11 +111,22 @@ Ctrl-C reliably stops whichever instance you directly launched, but not necessar
 
 ```mermaid
 flowchart TD
-    A["kuma-config.yaml"] --> B["Config::load (StrictYAML)"]
-    B --> C["scheduler::spawn_all"]
-    C --> D["One tokio task per check, its own interval"]
-    D --> E["checks::&lt;mode&gt;::run (e.g. ping)"]
-    E --> F["kuma::push (GET push_url)"]
+  A["kuma-config.yaml"] --> B["Config::load (StrictYAML)"]
+  B --> C{"--stop?"}
+  C -- "Yes" --> D["request_stop via lock port"] --> E(["Exit"])
+  C -- "No" --> F{"Single-instance lock active?"}
+  F -- "Yes" --> G["claim_single_instance"]
+  G -- "Already running" --> E
+  G -- "Claimed or unavailable" --> H["Build HTTP client"]
+  F -- "No" --> H
+  H --> I{"auto_update?"}
+  I -- "Yes" --> J["updater::check_and_update"]
+  J -- "Update applied" --> E
+  J -- "Continue" --> K["scheduler::spawn_all"]
+  I -- "No" --> K
+  K --> L["One tokio task per check, its own interval"]
+  L --> M["checks::&lt;mode&gt;::run (e.g. ping)"]
+  M --> N["kuma::push (GET push_url)"]
 ```
 
 Each check's task loop is independent: a slow or failing check never blocks or delays any other check's schedule.
