@@ -24,6 +24,13 @@ struct Cli {
     /// `config.yaml`, in that order, using the first one that exists.
     #[arg(short, long)]
     config: Option<PathBuf>,
+    /// Ask a running instance to shut down gracefully via the
+    /// single-instance lock port, then exit -- does not otherwise start
+    /// kuma-remote. Requires `instance_lock: true` and `service_mode: false`
+    /// in the config file (the same one a running instance would have
+    /// used), since that's what determines the port to connect to.
+    #[arg(long)]
+    stop: bool,
 }
 
 /// Default config file names tried, in order, when `--config` is not given.
@@ -45,12 +52,14 @@ fn resolve_config_path(explicit: Option<PathBuf>) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_CANDIDATES[0]))
 }
 
-/// Entry point: log the app name/version/authors, load config, claim the
-/// single-instance lock unless disabled (exiting immediately if another
-/// instance already holds it, before any debug logging of check details),
-/// log every check when `config.debug` is set, run the startup self-update
-/// check (if enabled), spawn one scheduler task per check, then block until
-/// Ctrl-C and abort all check tasks.
+/// Entry point: log the app name/version/authors, load config. If `--stop`
+/// was given, hand off to `handle_stop` and return immediately -- nothing
+/// below this point runs. Otherwise: claim the single-instance lock unless
+/// disabled (exiting immediately if another instance already holds it,
+/// before any debug logging of check details), log every check when
+/// `config.debug` is set, run the startup self-update check (if enabled),
+/// spawn one scheduler task per check, then block until either Ctrl-C or a
+/// `--stop` request and abort all check tasks.
 #[tokio::main]
 async fn main() -> Result<()> {
     logging::init();
@@ -66,6 +75,10 @@ async fn main() -> Result<()> {
     let config_path = resolve_config_path(cli.config);
     let config = config::Config::load(&config_path)
         .with_context(|| format!("Loading config from {}", config_path.display()))?;
+
+    if cli.stop {
+        return handle_stop(&config).await;
+    }
 
     tracing::info!(
         checks = config.checks.len(),
@@ -83,8 +96,8 @@ async fn main() -> Result<()> {
     //=-- sleeps. See `updater.rs`. Done before the debug-logging block below
     //=-- so a duplicate instance exits without ever logging check details
     //=-- (including push_url, a bearer credential).
-    let mut instance_lock = if config.service_mode || !config.instance_lock {
-        None
+    let (mut instance_lock, stop_requested) = if config.service_mode || !config.instance_lock {
+        (None, None)
     } else {
         let port = config.instance_lock_port;
         match tokio::task::spawn_blocking(move || updater::claim_single_instance(port))
@@ -95,8 +108,11 @@ async fn main() -> Result<()> {
                 tracing::warn!("Another kuma-remote instance is already running, exiting");
                 return Ok(());
             }
-            updater::SingleInstance::Claimed(listener) => Some(listener),
-            updater::SingleInstance::Unavailable => None,
+            updater::SingleInstance::Claimed {
+                listener,
+                stop_requested,
+            } => (Some(listener), Some(stop_requested)),
+            updater::SingleInstance::Unavailable => (None, None),
         }
     };
 
@@ -152,14 +168,65 @@ async fn main() -> Result<()> {
         config.report_run_failures,
     );
 
-    tokio::signal::ctrl_c()
-        .await
-        .context("Waiting for ctrl-c")?;
-    tracing::info!("Shutdown signal received, exiting");
+    //=-- Races Ctrl-C against a `--stop` request (see `updater.rs`) when the
+    //=-- single-instance lock is held -- that's the only case where a
+    //=-- `--stop` client has a listener to connect to in the first place, and
+    //=-- also the only case where Ctrl-C can fail to reach this process (a
+    //=-- self-spawned replacement is a detached grandchild the shell that
+    //=-- launched the original process won't route Ctrl-C to anymore).
+    match stop_requested {
+        Some(stop_requested) => {
+            tokio::select! {
+                result = tokio::signal::ctrl_c() => {
+                    result.context("Waiting for ctrl-c")?;
+                    tracing::info!("Shutdown signal received (Ctrl-C), exiting");
+                }
+                () = stop_requested.notified() => {
+                    tracing::info!("Shutdown signal received (--stop request), exiting");
+                }
+            }
+        }
+        None => {
+            tokio::signal::ctrl_c()
+                .await
+                .context("Waiting for ctrl-c")?;
+            tracing::info!("Shutdown signal received, exiting");
+        }
+    }
 
     for handle in handles {
         handle.abort();
     }
 
     Ok(())
+}
+
+/// Handles `--stop`: asks a running instance to shut down gracefully via
+/// the single-instance lock port (see `updater::request_stop`). Does not
+/// otherwise start kuma-remote.
+async fn handle_stop(config: &config::Config) -> Result<()> {
+    if config.service_mode {
+        anyhow::bail!(
+            "service_mode is true, so no single-instance lock/control channel is in use -- \
+             stop kuma-remote through your process supervisor instead"
+        );
+    }
+    if !config.instance_lock {
+        anyhow::bail!(
+            "instance_lock is false, so there is no control channel to connect to -- stop \
+             kuma-remote via Task Manager or `Stop-Process` instead"
+        );
+    }
+    if updater::request_stop(config.instance_lock_port)
+        .await
+        .context("Requesting stop")?
+    {
+        tracing::info!("Stop request acknowledged");
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "No running kuma-remote instance found on port {} to stop",
+            config.instance_lock_port
+        )
+    }
 }
