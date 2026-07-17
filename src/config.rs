@@ -67,6 +67,25 @@ pub struct Config {
     /// update. See `updater.rs`.
     #[serde(default)]
     pub slow_download_mode: bool,
+    /// `User-Agent` header sent on both shared `reqwest::Client`s (the push
+    /// client and the updater/web-check clients). Defaults to a desktop
+    /// Chrome-on-Windows string rather than reqwest's own `reqwest/x.y.z`,
+    /// since some reverse proxies / WAFs (e.g. Cloudflare bot protection)
+    /// block generic HTTP-client user agents while allowing browsers. See
+    /// `main.rs`.
+    #[serde(default = "default_http_user_agent")]
+    pub http_user_agent: String,
+    /// Connection-establishment timeout for both shared `reqwest::Client`s
+    /// (GitHub's API, an asset download, Kuma, or a `web`-checked site).
+    /// Does not bound the release-asset download itself, which overrides
+    /// this (see `updater.rs`). See `main.rs`.
+    #[serde(with = "humantime_serde", default = "default_http_connect_timeout")]
+    pub http_connect_timeout: Duration,
+    /// Overall request/response timeout for both shared `reqwest::Client`s.
+    /// Does not bound the release-asset download itself, which overrides
+    /// this (see `updater.rs`). See `main.rs`.
+    #[serde(with = "humantime_serde", default = "default_http_timeout")]
+    pub http_timeout: Duration,
     pub checks: Vec<CheckConfig>,
 }
 
@@ -88,6 +107,23 @@ fn default_instance_lock() -> bool {
 /// Default value for [`Config::instance_lock_port`] when absent from the config file.
 fn default_instance_lock_port() -> u16 {
     51247
+}
+
+/// Default value for [`Config::http_user_agent`] when absent from the config file.
+fn default_http_user_agent() -> String {
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+     (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        .to_string()
+}
+
+/// Default value for [`Config::http_connect_timeout`] when absent from the config file.
+fn default_http_connect_timeout() -> Duration {
+    Duration::from_secs(7)
+}
+
+/// Default value for [`Config::http_timeout`] when absent from the config file.
+fn default_http_timeout() -> Duration {
+    Duration::from_secs(30)
 }
 
 /// One monitored target and where to report its result.
@@ -169,11 +205,13 @@ impl Config {
     }
 
     /// Reject configs that are empty, have duplicate check ids, a
-    /// zero-length interval (which would spin the scheduler tick forever), or
-    /// an `instance_lock_port` of `0` while the lock is actually in effect
-    /// (port `0` always binds to a fresh OS-assigned port, so it can never
-    /// detect a duplicate instance — silently defeating the lock instead of
-    /// just weakening it, so this is a hard error rather than a warning).
+    /// zero-length interval (which would spin the scheduler tick forever), a
+    /// zero `http_connect_timeout`/`http_timeout` (which would time out
+    /// every connection/request instantly), or an `instance_lock_port` of
+    /// `0` while the lock is actually in effect (port `0` always binds to a
+    /// fresh OS-assigned port, so it can never detect a duplicate instance —
+    /// silently defeating the lock instead of just weakening it, so this is
+    /// a hard error rather than a warning).
     fn validate(&self) -> Result<()> {
         if self.checks.is_empty() {
             bail!("Config has no checks defined");
@@ -184,6 +222,12 @@ impl Config {
                  every bind attempt, defeating the single-instance lock entirely. Set a \
                  fixed non-zero port, or disable the lock with instance_lock: false."
             );
+        }
+        if self.http_connect_timeout.is_zero() {
+            bail!("http_connect_timeout is zero, which would time out every connection instantly");
+        }
+        if self.http_timeout.is_zero() {
+            bail!("http_timeout is zero, which would time out every request instantly");
         }
         let mut seen_ids = HashSet::new();
         for check in &self.checks {
