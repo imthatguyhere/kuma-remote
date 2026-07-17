@@ -17,7 +17,7 @@ self-replace = "1.5.0"
 serde = { version = "1.0.228", features = ["derive"] }
 sha2 = "0.11.0"
 strict-yaml-rust = { version = "0.2.0", features = ["serde"] }
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time", "process", "signal", "fs"] }
+tokio = { version = "1.53.0", features = ["rt-multi-thread", "macros", "time", "process", "signal", "fs"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
