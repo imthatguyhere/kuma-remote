@@ -153,6 +153,21 @@ async fn main() -> Result<()> {
         .build()
         .context("Building HTTP client")?;
 
+    //=-- Used only as a fallback by `web` checks, when an `https` `url`
+    //=-- fails certificate validation under the strict `client` above --
+    //=-- so a monitor doesn't flip to Down purely because a cert expired,
+    //=-- as long as the server is still answering (see `checks/web.rs`).
+    let lenient_client = reqwest::Client::builder()
+        .user_agent(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        )
+        .connect_timeout(Duration::from_secs(7))
+        .timeout(Duration::from_secs(30))
+        .danger_accept_invalid_certs(true)
+        .build()
+        .context("Building lenient HTTP client")?;
+
     if config.auto_update {
         let outcome = updater::check_and_update(
             &client,
@@ -174,6 +189,7 @@ async fn main() -> Result<()> {
     let handles = scheduler::spawn_all(
         config.checks,
         client,
+        lenient_client,
         config.debug,
         config.report_run_failures,
     );
