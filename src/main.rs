@@ -10,7 +10,6 @@ mod scheduler;
 mod updater;
 
 use std::path::PathBuf;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -143,13 +142,13 @@ async fn main() -> Result<()> {
     //=-- request/response cycle for everything except the release-asset
     //=-- download, which overrides it (see `updater.rs`) since that response
     //=-- can legitimately take longer than a small API/push response would.
+    //=-- All three are configurable (`http_user_agent`/`http_connect_timeout`/
+    //=-- `http_timeout`) since a strict WAF/proxy or a slow link may need
+    //=-- different values than the defaults below.
     let client = reqwest::Client::builder()
-        .user_agent(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
-             (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        )
-        .connect_timeout(Duration::from_secs(7))
-        .timeout(Duration::from_secs(30))
+        .user_agent(config.http_user_agent.clone())
+        .connect_timeout(config.http_connect_timeout)
+        .timeout(config.http_timeout)
         .build()
         .context("Building HTTP client")?;
 
@@ -158,12 +157,9 @@ async fn main() -> Result<()> {
     //=-- so a monitor doesn't flip to Down purely because a cert expired,
     //=-- as long as the server is still answering (see `checks/web.rs`).
     let lenient_client = reqwest::Client::builder()
-        .user_agent(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
-             (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        )
-        .connect_timeout(Duration::from_secs(7))
-        .timeout(Duration::from_secs(30))
+        .user_agent(config.http_user_agent.clone())
+        .connect_timeout(config.http_connect_timeout)
+        .timeout(config.http_timeout)
         .danger_accept_invalid_certs(true)
         .build()
         .context("Building lenient HTTP client")?;
