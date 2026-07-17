@@ -106,6 +106,16 @@ pub struct CheckConfig {
     pub host: Option<String>,
     /// Full Uptime Kuma push URL, without a query string.
     pub push_url: String,
+    /// URL to request. Required for `Web`; unused otherwise.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Substring to search for in the response body. Only meaningful for
+    /// `Web`. When set, the body is always read and checked for it
+    /// regardless of status, but `Up` requires both a 2xx status and the
+    /// match; when unset, the check reports `Up`/`Down` on the status code
+    /// alone.
+    #[serde(default)]
+    pub test_string: Option<String>,
     /// How often to run this check, e.g. "60s", "5m", "1h".
     #[serde(with = "humantime_serde")]
     pub interval: Duration,
@@ -121,6 +131,12 @@ pub enum CheckMode {
     /// anything. If `host` is given, also pings it and includes the
     /// latency; a failed ping does not turn the heartbeat `Down`.
     Heartbeat,
+    /// Sends a GET request to `url` (required) and reports `Up`/`Down`
+    /// based on the response. An `https` `url` whose certificate only
+    /// validates with certificate checking disabled is still treated as
+    /// reachable, but logs a warning about the bad certificate. See
+    /// `checks::web` for the up/down classification rules.
+    Web,
 }
 
 impl Config {
@@ -179,6 +195,9 @@ impl Config {
             }
             if check.mode == CheckMode::Ping && check.host.is_none() {
                 bail!("Check {} uses mode ping, which requires a host", check.id);
+            }
+            if check.mode == CheckMode::Web && check.url.is_none() {
+                bail!("Check {} uses mode web, which requires a url", check.id);
             }
         }
         Ok(())
