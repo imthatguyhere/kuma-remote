@@ -12,18 +12,26 @@ checks:
     mode: heartbeat #=-- always reports Up with msg "Heartbeat"; host is optional
     host: 8.8.8.8 #=-- optional — if set, also pings and includes latency, good for pinging 8.8.8.8 — or similar — for internet latency
     push_url: "https://kuma.mydomain.com/api/push/HbEaT456"
-    interval: 60s #=-- It's recommended to set the heartbeat interval to at least 30 seconds longer than the longest expected check interval
+    interval: 60s #=-- It's recommended to set the push monitor's heartbeat interval to at least 30 seconds longer than the longest expected check interval
     
   - id: web01
     name: "Prod Web Server"
     mode: ping
     host: 192.168.1.10
     push_url: "https://kuma.mydomain.com/api/push/AbC123XyZ"
-    interval: 60s #=-- It's recommended to set the heartbeat interval to at least 30 seconds longer than the longest expected check interval
+    interval: 60s #=-- It's recommended to set the push monitor's heartbeat interval to at least 30 seconds longer than the longest expected check interval
 
   - id: db01
     name: "Database Host"
     mode: ping
     host: db.internal.local
     push_url: "https://kuma.mydomain.com/api/push/QwErTy987"
-    interval: 5m #=-- It's recommended to set the heartbeat interval to at least 30 seconds longer than the longest expected check interval
+    interval: 5m #=-- It's recommended to set the push monitor's heartbeat interval to at least 30 seconds longer than the longest expected check interval
+
+  - id: site01
+    name: "Example Web Site"
+    mode: web
+    url: "https://example.com" #=-- required for web; the URL requested. A bad/expired/self-signed https certificate is warned about in logs but does not fail the check on its own
+    test_string: "Welcome" #=-- optional; if set, the body is always checked for this string even on a non-2xx response, but up requires both a 2xx status and the match. If unset, up requires only a 2xx status code
+    push_url: "https://kuma.mydomain.com/api/push/WebSite1"
+    interval: 60s #=-- It's recommended to set the push monitor's heartbeat interval to at least 30 seconds longer than the longest expected check interval
