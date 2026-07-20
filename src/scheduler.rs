@@ -27,11 +27,14 @@ pub struct HttpClients {
 /// pushed URL (including query string) on every push. `report_run_failures`
 /// controls whether a run error (as opposed to a completed `Down` result)
 /// is also pushed to Kuma as `down`, per [`crate::config::Config::report_run_failures`].
+/// `max_response_size` is only read by `Web` checks; see
+/// [`crate::config::Config::web_max_response_size`].
 pub fn spawn_all(
     checks: Vec<CheckConfig>,
     clients: HttpClients,
     debug: bool,
     report_run_failures: bool,
+    max_response_size: u64,
 ) -> Vec<JoinHandle<()>> {
     checks
         .into_iter()
@@ -41,6 +44,7 @@ pub fn spawn_all(
                 clients.clone(),
                 debug,
                 report_run_failures,
+                max_response_size,
             ))
         })
         .collect()
@@ -56,13 +60,14 @@ async fn run_check_loop(
     clients: HttpClients,
     debug: bool,
     report_run_failures: bool,
+    max_response_size: u64,
 ) {
     let mut ticker = interval(check.interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
         ticker.tick().await;
-        if let Err(err) = run_once(&check, &clients, debug).await {
+        if let Err(err) = run_once(&check, &clients, debug, max_response_size).await {
             error!(check_id = %check.id, error = %err, "Check run failed");
             if report_run_failures {
                 let status = PushStatus::Down {
@@ -79,8 +84,14 @@ async fn run_check_loop(
 }
 
 /// Run `check` once per its configured `mode`, log the outcome, and push
-/// the resulting status to Kuma.
-async fn run_once(check: &CheckConfig, clients: &HttpClients, debug: bool) -> anyhow::Result<()> {
+/// the resulting status to Kuma. `max_response_size` is only read by `Web`
+/// checks.
+async fn run_once(
+    check: &CheckConfig,
+    clients: &HttpClients,
+    debug: bool,
+    max_response_size: u64,
+) -> anyhow::Result<()> {
     let status = match check.mode {
         CheckMode::Ping => {
             let host = check
@@ -122,6 +133,7 @@ async fn run_once(check: &CheckConfig, clients: &HttpClients, debug: bool) -> an
                 &check.id,
                 url,
                 check.test_string.as_deref(),
+                max_response_size,
             )
             .await?
             {
