@@ -81,7 +81,7 @@ Top-level fields:
 - `instance_lock` — optional, defaults to `true`. Ignored when `service_mode` is `true`. See [Auto-Update](#auto-update) below.
 - `instance_lock_port` — optional, defaults to `51247`. See [Auto-Update](#auto-update) below.
 - `slow_download_mode` — optional, defaults to `false`. See [Auto-Update](#auto-update) below.
-- `http_user_agent` — optional, defaults to a desktop-Chrome-on-Windows `User-Agent` string. Sent on every HTTP request `kuma-remote` makes (push, update check/download, `web` check). Override this if your reverse proxy/WAF filters on user agent and expects something else.
+- `http_user_agent` — optional, defaults to a desktop-Chrome-on-Windows `User-Agent` string. Sent on every HTTP request `kuma-remote` makes (push, update check/download, `web` check). Override this if your reverse proxy/WAF filters on user agent and expects something else. Rejected at startup if empty.
 - `http_connect_timeout` — optional, defaults to `7s`. Max time to establish a connection for any of the above requests, as a duration string. Does not bound the release-asset download itself (see [Auto-Update](#auto-update)). Rejected at startup if zero.
 - `http_timeout` — optional, defaults to `30s`. Max time for the whole request/response cycle for any of the above requests, as a duration string. Does not bound the release-asset download itself (see [Auto-Update](#auto-update)). Rejected at startup if zero.
 - `checks` — the list of checks to run, described below.
@@ -92,12 +92,12 @@ Fields, per entry under `checks`:
 - `name` — Required. Human-readable name, used only in logs.
 - `mode` — Required. Check strategy: `ping`, `heartbeat`, or `web` (see Check Modes below).
 - `host` — IP address or hostname to check. Required for `ping`. Optional for `heartbeat`: when set, it's also pinged and a successful latency is included in the push; a missing host, or a failed/timed-out ping, doesn't affect the heartbeat's `Up` status. Unused for `web`.
-- `url` — URL to request. Required for `web`; unused otherwise.
-- `test_string` — Optional, only meaningful for `web`. A substring to search for in the response body. When set, the body is always read and checked for it, even on a non-2xx response — but the check only reports up when the status is also 2xx; either the status or the match failing reports down, with the reason naming both. When unset, the check instead reports down on any non-2xx status code.
+- `url` — URL to request. Required (non-empty) for `web`; unused otherwise. If it has no `scheme://` (e.g. a bare `example.com`), `https://` is prepended automatically and a warning is logged — a schemeless URL would otherwise fail every run with `Request failed: builder error` rather than actually being requested.
+- `test_string` — Optional, only meaningful for `web`. A substring to search for in the response body. When set, the body is always read and checked for it, even on a non-2xx response — but the check only reports up when the status is also 2xx; either the status or the match failing reports down, with the reason naming both. When unset, the check instead reports down on any non-2xx status code. Setting it on a `ping`/`heartbeat` check is not an error, but logs a startup warning, since it's simply ignored there.
 - `push_url` — Required. Full Uptime Kuma push URL for this monitor. Kuma's dashboard displays the push URL with a `?status=up&msg=OK&ping=` example suffix attached for you to copy as a curl command; `kuma-remote` builds its own `status`/`msg`/`ping` query string, so if `push_url` still has a `?...` suffix on load, it's stripped automatically and logged as a warning rather than rejected.
 - `interval` — Required. How often to run the check, as a duration string (`30s`, `5m`, `1h`, ...).
 
-The config file must define at least one check; a zero-length `interval`, a duplicate `id`, a `ping` check missing `host`, or a `web` check missing `url` is rejected at startup.
+The config file must define at least one check; a zero-length `interval`, a duplicate `id`, an empty `http_user_agent`, a `ping` check missing `host`, or a `web` check with a missing or empty `url` is rejected at startup.
 
 ### Environment variables
 
@@ -133,7 +133,7 @@ flowchart TD
   C -- "No" --> F{"Single-instance lock active?"}
   F -- "Yes" --> G["claim_single_instance"]
   G -- "Already running" --> E
-  G -- "Claimed or unavailable" --> H["Build HTTP client"]
+  G -- "Claimed or unavailable" --> H["Build HTTP clients (strict + lenient)"]
   F -- "No" --> H
   H --> I{"auto_update?"}
   I -- "Yes" --> J["updater::check_and_update"]
@@ -179,10 +179,11 @@ Any failure in this process — no network access, GitHub rate limiting, no matc
 - `ping` — Sends a single ICMP echo to `host` and reports latency (up) or the failure reason (down). `host` is required.
 - `heartbeat` — Always reports up with message "Heartbeat", signaling the `kuma-remote` process itself is alive rather than testing reachability.
   - `host` is optional; if set, it's also pinged once and a successful latency is included, but a failed or missing ping never turns the heartbeat down.
-- `web` — Sends a single GET request to `url` (required) and reports up (with latency) or down (with a reason) based on the response.
-  - If `test_string` is set, the response body is always read and checked for it, even when the status isn't 2xx. Up requires both a 2xx status and the match; the message/reason always names both, e.g. `200 ("Welcome" matched)` on up, `404 ("Welcome" matched)` or `200 ("Welcome" not matched)` on down.
+- `web` — Sends a single GET request to `url` (required, non-empty) and reports up (with latency) or down (with a reason) based on the response. The response body is always read to completion (even when `test_string` is unset), so the reported latency covers the whole page load, not just time-to-first-byte.
+  - If `test_string` is set, the (already-read) response body is checked for it, even when the status isn't 2xx. Up requires both a 2xx status and the match; the message/reason always names both, e.g. `200 ("Welcome" matched)` on up, `404 ("Welcome" matched)` or `200 ("Welcome" not matched)` on down.
   - If `test_string` is unset, up/down depends only on the HTTP status code (2xx is up). On up, the message is just the status code, e.g. `200`; on down, the reason is the status code itself.
-  - For an `https` `url`, a request that fails certificate validation is retried once with certificate validation disabled. If that retry succeeds, the check still proceeds as reachable (evaluated per the rules above) rather than reporting down purely because of the bad certificate, but a warning noting the invalid/expired/self-signed certificate is logged either way.
+  - A request that fails with a TLS certificate error (e.g. an expired, self-signed, or otherwise untrusted certificate on an `https://` `url`, including one reached only after a redirect) is retried once with certificate validation disabled. If that retry succeeds, the check still proceeds as reachable (evaluated per the rules above) rather than reporting down purely because of the bad certificate, but a warning noting the invalid/expired/self-signed certificate is logged either way, and only the retry's own duration counts toward the reported latency. Any other kind of failure (unreachable host, DNS failure, timeout, ...) is reported down directly, without a retry.
+  - If the body itself fails to fully download after a successful response (e.g. the connection drops mid-transfer), the check reports down with the error, the same as any other failure -- it never crashes the check run.
 
 ## License
 
