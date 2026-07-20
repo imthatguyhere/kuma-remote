@@ -8,17 +8,19 @@
 //! whether the string matched. An empty `test_string` is treated the same as
 //! it being unset, rather than trivially matching every response.
 //!
-//! The body is streamed in chunks rather than read in one shot so
-//! `max_response_size` can be enforced against it (both `Content-Length`
-//! up front, and actual bytes received as they arrive) — a monitored `url`
-//! is operator-configured and may point anywhere, so an unexpectedly large
-//! or unbounded response is reported `Down` instead of being buffered into
-//! memory without limit.
+//! The body is streamed in chunks rather than read in one shot and capped at
+//! `max_response_size` — a monitored `url` is operator-configured and may
+//! point anywhere, so an unexpectedly large or unbounded response is
+//! truncated to that many bytes (with a warning logged) instead of being
+//! buffered into memory without limit. The cap exists to bound memory use,
+//! not to judge the check: the status code is already known regardless, and
+//! evaluation proceeds against whatever of the body was read, rather than
+//! reporting `Down` on size alone.
 //!
-//! `latency_ms` always covers the whole page load (through the full body
-//! download, not just headers) and reflects only the request that actually
-//! answered: a failed `strict_client` attempt's time is never folded into a
-//! successful `lenient_client` retry's latency.
+//! `latency_ms` covers the whole read (through the full body download, or up
+//! to the point of truncation, not just headers) and reflects only the
+//! request that actually answered: a failed `strict_client` attempt's time
+//! is never folded into a successful `lenient_client` retry's latency.
 //!
 //! For an `https` `url`, a request that fails with a certificate error is
 //! retried once through `lenient_client` (which accepts invalid
@@ -77,9 +79,10 @@ fn is_certificate_error(err: &reqwest::Error) -> bool {
 ///   body is still fully read either way, so `latency_ms` reflects the whole
 ///   page load rather than just time-to-first-byte.
 ///
-/// Either way, the body is read in chunks and the check reports `Down` if
-/// `max_response_size` bytes is exceeded (checked against `Content-Length`
-/// up front when present, and against bytes actually received either way).
+/// Either way, the body is read in chunks up to `max_response_size` bytes; a
+/// longer response is truncated to that many bytes (logging a warning) and
+/// evaluation proceeds against the truncated body, rather than reporting
+/// `Down` purely because the response was large.
 pub async fn check_once(
     strict_client: &Client,
     lenient_client: &Client,
@@ -124,40 +127,39 @@ pub async fn check_once(
 
     let status = response.status();
 
-    if let Some(total) = response.content_length()
-        && total > max_response_size
-    {
-        return Ok(WebOutcome::Down {
-            reason: format!(
-                "Response declared {total} bytes, exceeding the {max_response_size}-byte limit"
-            ),
-        });
-    }
-
-    //=-- Always drain the body so latency_ms reflects the whole page load,
-    //=-- not just time-to-first-byte -- and so a mid-download failure is
-    //=-- reported the same way as every other failure path here: Down with
-    //=-- the error attached, not a hard error. Streamed chunk-by-chunk (rather
-    //=-- than `.text()`) so max_response_size is also enforced against bytes
-    //=-- actually received, in case Content-Length was absent or wrong.
+    //=-- Streamed chunk-by-chunk (rather than `.text()`) and capped at
+    //=-- max_response_size -- the cap exists to bound memory use, not to
+    //=-- judge the check, so an oversized body is truncated for evaluation
+    //=-- rather than reported Down on size alone. The status code is already
+    //=-- known at this point regardless, so a check with no test_string
+    //=-- doesn't need the (possibly truncated) body at all.
     let mut body_bytes = Vec::new();
     loop {
-        let chunk = match response.chunk().await {
-            Ok(Some(chunk)) => chunk,
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                body_bytes.extend_from_slice(&chunk);
+                if body_bytes.len() as u64 > max_response_size {
+                    //=-- Only truly truncated once a chunk pushes us past the
+                    //=-- cap -- a body of exactly max_response_size bytes with
+                    //=-- nothing after it is a complete read, not a truncation.
+                    body_bytes.truncate(max_response_size as usize);
+                    warn!(
+                        check_id = %check_id,
+                        url = %url,
+                        max_response_size,
+                        "Response body exceeded max_response_size -- truncating for \
+                         status/test_string evaluation instead of failing the check on \
+                         size alone"
+                    );
+                    break;
+                }
+            }
             Ok(None) => break,
             Err(err) => {
                 return Ok(WebOutcome::Down {
                     reason: format!("Reading response body: {err}"),
                 });
             }
-        };
-        body_bytes.extend_from_slice(&chunk);
-        if body_bytes.len() as u64 > max_response_size {
-            return Ok(WebOutcome::Down {
-                reason: format!(
-                    "Response body exceeded the {max_response_size}-byte limit while reading"
-                ),
-            });
         }
     }
     let body = String::from_utf8_lossy(&body_bytes).into_owned();
