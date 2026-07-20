@@ -86,6 +86,14 @@ pub struct Config {
     /// this (see `updater.rs`). See `main.rs`.
     #[serde(with = "humantime_serde", default = "default_http_timeout")]
     pub http_timeout: Duration,
+    /// Max response body size, in bytes, that a `web` check will buffer
+    /// into memory. Enforced against `Content-Length` up front when present,
+    /// and against bytes actually received as they stream in either way (in
+    /// case `Content-Length` was absent or wrong) -- see `checks/web.rs`.
+    /// Unrelated to the release-asset download's own `MAX_DOWNLOAD_SIZE` cap
+    /// in `updater.rs`.
+    #[serde(default = "default_web_max_response_size")]
+    pub web_max_response_size: u64,
     pub checks: Vec<CheckConfig>,
 }
 
@@ -126,6 +134,11 @@ fn default_http_timeout() -> Duration {
     Duration::from_secs(30)
 }
 
+/// Default value for [`Config::web_max_response_size`] when absent from the config file.
+fn default_web_max_response_size() -> u64 {
+    25 * 1024 * 1024
+}
+
 /// One monitored target and where to report its result.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CheckConfig {
@@ -142,18 +155,18 @@ pub struct CheckConfig {
     pub host: Option<String>,
     /// Full Uptime Kuma push URL, without a query string.
     pub push_url: String,
-    /// URL to request. Required (non-empty) for `Web`; unused otherwise. If
-    /// it has no `scheme://` prefix (e.g. a bare `example.com`), a warning
-    /// is logged and `https://` is prepended by `Config::normalize` --
-    /// `reqwest` otherwise rejects a schemeless URL outright with a
-    /// `builder error` instead of sending a request at all.
+    /// URL to request. Required (non-blank) for `Web`; unused otherwise. If
+    /// it doesn't parse as an absolute URL (e.g. a bare `example.com` with
+    /// no scheme), a warning is logged and `https://` is prepended by
+    /// `Config::normalize` -- `reqwest` otherwise rejects a schemeless URL
+    /// outright with a `builder error` instead of sending a request at all.
     #[serde(default)]
     pub url: Option<String>,
     /// Substring to search for in the response body. Only meaningful for
-    /// `Web`. When set, the body is always read and checked for it
-    /// regardless of status, but `Up` requires both a 2xx status and the
-    /// match; when unset, the check reports `Up`/`Down` on the status code
-    /// alone.
+    /// `Web`. When set to a non-empty value, the body is always read and
+    /// checked for it regardless of status, but `Up` requires both a 2xx
+    /// status and the match; when unset or empty, the check reports
+    /// `Up`/`Down` on the status code alone.
     #[serde(default)]
     pub test_string: Option<String>,
     /// How often to run this check, e.g. "60s", "5m", "1h".
@@ -217,10 +230,19 @@ impl Config {
                      used by mode web and will be ignored"
                 );
             }
+            if let Some(url) = check.url.as_mut()
+                && url.trim().len() != url.len()
+            {
+                //=-- Trimmed first so a whitespace-only value (e.g. " ") becomes
+                //=-- truly empty here, rather than surviving the emptiness check
+                //=-- below and getting "https://" prepended into a bogus
+                //=-- "https:// " that only fails later, at request time.
+                *url = url.trim().to_string();
+            }
             if let Some(url) = check
                 .url
                 .as_mut()
-                .filter(|url| !url.is_empty() && !url.contains("://"))
+                .filter(|url| !url.is_empty() && reqwest::Url::parse(url).is_err())
             {
                 warn!(
                     check_id = %check.id,
@@ -235,14 +257,15 @@ impl Config {
     /// Reject configs that are empty, have duplicate check ids, a
     /// zero-length interval (which would spin the scheduler tick forever), a
     /// zero `http_connect_timeout`/`http_timeout` (which would time out
-    /// every connection/request instantly), an empty `http_user_agent`
-    /// (which would send an empty User-Agent header, defeating the reason
-    /// it's configurable in the first place), a `web` check with an empty
-    /// or missing `url`, or an `instance_lock_port` of `0` while the lock is
-    /// actually in effect (port `0` always binds to a fresh OS-assigned
-    /// port, so it can never detect a duplicate instance — silently
-    /// defeating the lock instead of just weakening it, so this is a hard
-    /// error rather than a warning).
+    /// every connection/request instantly), a zero `web_max_response_size`
+    /// (which would reject every web check's response body), an empty
+    /// `http_user_agent` (which would send an empty User-Agent header,
+    /// defeating the reason it's configurable in the first place), a `web`
+    /// check with a missing or blank (empty or whitespace-only) `url`, or an
+    /// `instance_lock_port` of `0` while the lock is actually in effect
+    /// (port `0` always binds to a fresh OS-assigned port, so it can never
+    /// detect a duplicate instance — silently defeating the lock instead of
+    /// just weakening it, so this is a hard error rather than a warning).
     fn validate(&self) -> Result<()> {
         if self.checks.is_empty() {
             bail!("Config has no checks defined");
@@ -259,6 +282,9 @@ impl Config {
         }
         if self.http_timeout.is_zero() {
             bail!("http_timeout is zero, which would time out every request instantly");
+        }
+        if self.web_max_response_size == 0 {
+            bail!("web_max_response_size is zero, which would reject every web check's response body");
         }
         if self.http_user_agent.is_empty() {
             bail!(
@@ -277,7 +303,9 @@ impl Config {
             if check.mode == CheckMode::Ping && check.host.is_none() {
                 bail!("Check {} uses mode ping, which requires a host", check.id);
             }
-            if check.mode == CheckMode::Web && check.url.as_deref().unwrap_or("").is_empty() {
+            if check.mode == CheckMode::Web
+                && check.url.as_deref().unwrap_or("").trim().is_empty()
+            {
                 bail!(
                     "Check {} uses mode web, which requires a non-empty url",
                     check.id
