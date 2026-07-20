@@ -87,11 +87,12 @@ pub struct Config {
     #[serde(with = "humantime_serde", default = "default_http_timeout")]
     pub http_timeout: Duration,
     /// Max response body size, in bytes, that a `web` check will buffer
-    /// into memory. Enforced against `Content-Length` up front when present,
-    /// and against bytes actually received as they stream in either way (in
-    /// case `Content-Length` was absent or wrong) -- see `checks/web.rs`.
-    /// Unrelated to the release-asset download's own `MAX_DOWNLOAD_SIZE` cap
-    /// in `updater.rs`.
+    /// into memory. Bounds memory use, not the check's outcome: a longer
+    /// response is truncated to this many bytes (with a warning logged) and
+    /// evaluation proceeds against the truncated body -- the check is never
+    /// reported `Down` purely because the response was large. See
+    /// `checks/web.rs`. Unrelated to the release-asset download's own
+    /// `MAX_DOWNLOAD_SIZE` cap in `updater.rs`.
     #[serde(default = "default_web_max_response_size")]
     pub web_max_response_size: u64,
     pub checks: Vec<CheckConfig>,
@@ -258,14 +259,16 @@ impl Config {
     /// zero-length interval (which would spin the scheduler tick forever), a
     /// zero `http_connect_timeout`/`http_timeout` (which would time out
     /// every connection/request instantly), a zero `web_max_response_size`
-    /// (which would reject every web check's response body), an empty
-    /// `http_user_agent` (which would send an empty User-Agent header,
-    /// defeating the reason it's configurable in the first place), a `web`
-    /// check with a missing or blank (empty or whitespace-only) `url`, or an
-    /// `instance_lock_port` of `0` while the lock is actually in effect
-    /// (port `0` always binds to a fresh OS-assigned port, so it can never
-    /// detect a duplicate instance — silently defeating the lock instead of
-    /// just weakening it, so this is a hard error rather than a warning).
+    /// (which would truncate every web check's body to nothing before any
+    /// status/test_string evaluation, silently defeating `test_string`
+    /// matching), an empty `http_user_agent` (which would send an empty
+    /// User-Agent header, defeating the reason it's configurable in the
+    /// first place), a `web` check with a missing or blank (empty or
+    /// whitespace-only) `url`, or an `instance_lock_port` of `0` while the
+    /// lock is actually in effect (port `0` always binds to a fresh
+    /// OS-assigned port, so it can never detect a duplicate instance —
+    /// silently defeating the lock instead of just weakening it, so this is
+    /// a hard error rather than a warning).
     fn validate(&self) -> Result<()> {
         if self.checks.is_empty() {
             bail!("Config has no checks defined");
@@ -284,7 +287,10 @@ impl Config {
             bail!("http_timeout is zero, which would time out every request instantly");
         }
         if self.web_max_response_size == 0 {
-            bail!("web_max_response_size is zero, which would reject every web check's response body");
+            bail!(
+                "web_max_response_size is zero, which would truncate every web check's \
+                 response body to nothing before it's ever evaluated"
+            );
         }
         if self.http_user_agent.is_empty() {
             bail!(
