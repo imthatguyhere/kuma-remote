@@ -10,18 +10,26 @@ use crate::checks::{heartbeat, ping, web};
 use crate::config::{CheckConfig, CheckMode};
 use crate::kuma::{self, PushStatus};
 
+/// The HTTP clients shared by every check task. `client` is used for every
+/// check mode; `lenient_client` is only read by `Web` checks, as a fallback
+/// when an `https` `url` fails certificate validation under `client` (see
+/// `checks/web.rs`). Bundled into one struct (rather than threaded as
+/// separate parameters) so a future mode-specific client is one new field
+/// here, not a new parameter through every function below.
+#[derive(Clone)]
+pub struct HttpClients {
+    pub client: Client,
+    pub lenient_client: Client,
+}
+
 /// Spawn one background task per check; returns their join handles so the
-/// caller can abort them on shutdown. `client` is used for every check
-/// mode; `lenient_client` is only used by `Web` checks, as a fallback when
-/// an `https` `url` fails certificate validation under `client`. `debug`
-/// enables logging the exact pushed URL (including query string) on every
-/// push. `report_run_failures` controls whether a run error (as opposed to
-/// a completed `Down` result) is also pushed to Kuma as `down`, per
-/// [`crate::config::Config::report_run_failures`].
+/// caller can abort them on shutdown. `debug` enables logging the exact
+/// pushed URL (including query string) on every push. `report_run_failures`
+/// controls whether a run error (as opposed to a completed `Down` result)
+/// is also pushed to Kuma as `down`, per [`crate::config::Config::report_run_failures`].
 pub fn spawn_all(
     checks: Vec<CheckConfig>,
-    client: Client,
-    lenient_client: Client,
+    clients: HttpClients,
     debug: bool,
     report_run_failures: bool,
 ) -> Vec<JoinHandle<()>> {
@@ -30,8 +38,7 @@ pub fn spawn_all(
         .map(|check| {
             tokio::spawn(run_check_loop(
                 check,
-                client.clone(),
-                lenient_client.clone(),
+                clients.clone(),
                 debug,
                 report_run_failures,
             ))
@@ -46,8 +53,7 @@ pub fn spawn_all(
 /// loop.
 async fn run_check_loop(
     check: CheckConfig,
-    client: Client,
-    lenient_client: Client,
+    clients: HttpClients,
     debug: bool,
     report_run_failures: bool,
 ) {
@@ -56,13 +62,15 @@ async fn run_check_loop(
 
     loop {
         ticker.tick().await;
-        if let Err(err) = run_once(&check, &client, &lenient_client, debug).await {
+        if let Err(err) = run_once(&check, &clients, debug).await {
             error!(check_id = %check.id, error = %err, "Check run failed");
             if report_run_failures {
                 let status = PushStatus::Down {
                     message: format!("Check run failed: {err}"),
                 };
-                if let Err(push_err) = kuma::push(&client, &check.push_url, status, debug).await {
+                if let Err(push_err) =
+                    kuma::push(&clients.client, &check.push_url, status, debug).await
+                {
                     error!(check_id = %check.id, error = %push_err, "Failed to push run-failure status");
                 }
             }
@@ -72,12 +80,7 @@ async fn run_check_loop(
 
 /// Run `check` once per its configured `mode`, log the outcome, and push
 /// the resulting status to Kuma.
-async fn run_once(
-    check: &CheckConfig,
-    client: &Client,
-    lenient_client: &Client,
-    debug: bool,
-) -> anyhow::Result<()> {
+async fn run_once(check: &CheckConfig, clients: &HttpClients, debug: bool) -> anyhow::Result<()> {
     let status = match check.mode {
         CheckMode::Ping => {
             let host = check
@@ -111,19 +114,21 @@ async fn run_once(
         CheckMode::Web => {
             let url = check
                 .url
-                .as_ref()
-                .expect("Config::validate requires a url for mode web")
-                .clone();
+                .as_deref()
+                .expect("Config::validate requires a url for mode web");
             match web::check_once(
-                client,
-                lenient_client,
+                &clients.client,
+                &clients.lenient_client,
                 &check.id,
-                &url,
+                url,
                 check.test_string.as_deref(),
             )
             .await?
             {
-                web::WebOutcome::Up { latency_ms, message } => {
+                web::WebOutcome::Up {
+                    latency_ms,
+                    message,
+                } => {
                     info!(check_id = %check.id, name = %check.name, latency_ms, message = %message, "Up");
                     PushStatus::Up {
                         ping_ms: Some(latency_ms),
@@ -138,5 +143,5 @@ async fn run_once(
         }
     };
 
-    kuma::push(client, &check.push_url, status, debug).await
+    kuma::push(&clients.client, &check.push_url, status, debug).await
 }
