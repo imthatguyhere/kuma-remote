@@ -148,6 +148,16 @@ const DOWNLOAD_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 /// in-memory allocation, not against a legitimately larger future build.
 const MAX_DOWNLOAD_SIZE: u64 = 200 * 1024 * 1024;
 
+/// Per-request timeout override for the release-asset download, replacing
+/// the shared client's `http_timeout` for that one request. reqwest's
+/// client-level `.timeout()` wraps the whole response body stream, not just
+/// the time to first byte, so without this override it would race against
+/// (and normally win over) [`DOWNLOAD_HARD_TIMEOUT`]/[`DOWNLOAD_STALL_TIMEOUT`]
+/// below for any download slower than `http_timeout`. Deliberately generous
+/// -- the real bound is enforced by `download_with_progress`'s own
+/// per-chunk timeout, not this value.
+const DOWNLOAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Owns a claimed single-instance lock: the bound `listener` and a shutdown
 /// flag shared with its handshake responder thread (see
 /// `spawn_handshake_responder`). Dropping this (including via
@@ -527,6 +537,7 @@ async fn try_update(
 
     let response = client
         .get(&asset.browser_download_url)
+        .timeout(DOWNLOAD_REQUEST_TIMEOUT)
         .send()
         .await
         .context("Downloading updated executable")?
