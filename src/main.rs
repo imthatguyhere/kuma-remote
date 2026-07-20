@@ -204,6 +204,7 @@ async fn main() -> Result<()> {
         },
         config.debug,
         config.report_run_failures,
+        config.web_max_response_size,
     );
 
     //=-- Races Ctrl-C against a `--stop` request (see `updater.rs`) when the
