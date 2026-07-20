@@ -139,18 +139,35 @@ pub async fn check_once(
     //=-- judge the check, so an oversized body is truncated for evaluation
     //=-- rather than reported Down on size alone. The status code is already
     //=-- known at this point regardless, so a check with no test_string
-    //=-- doesn't need the (possibly truncated) body at all.
-    let mut body_bytes = Vec::new();
+    //=-- doesn't need the (possibly truncated) body at all -- only the byte
+    //=-- count (for the truncation check) and the read itself (for latency).
+    let needle = test_string.filter(|needle| !needle.is_empty());
+    //=-- usize::try_from + saturating fallback -- on a target where usize is
+    //=-- narrower than u64, `max_response_size as usize` would silently wrap
+    //=-- (e.g. a configured 4 GiB cap becoming 0) instead of clamping to the
+    //=-- largest length actually representable.
+    let max_len = usize::try_from(max_response_size).unwrap_or(usize::MAX);
+    let mut body_bytes: Option<Vec<u8>> = if needle.is_some() {
+        Some(Vec::new())
+    } else {
+        None
+    };
+    let mut bytes_read: u64 = 0;
     let mut truncated = false;
     loop {
         match response.chunk().await {
             Ok(Some(chunk)) => {
-                body_bytes.extend_from_slice(&chunk);
-                if body_bytes.len() as u64 > max_response_size {
+                bytes_read += chunk.len() as u64;
+                if let Some(body_bytes) = &mut body_bytes {
+                    body_bytes.extend_from_slice(&chunk);
+                }
+                if bytes_read > max_response_size {
                     //=-- Only truly truncated once a chunk pushes us past the
                     //=-- cap -- a body of exactly max_response_size bytes with
                     //=-- nothing after it is a complete read, not a truncation.
-                    body_bytes.truncate(max_response_size as usize);
+                    if let Some(body_bytes) = &mut body_bytes {
+                        body_bytes.truncate(max_len);
+                    }
                     truncated = true;
                     warn!(
                         check_id = %check_id,
@@ -171,11 +188,15 @@ pub async fn check_once(
             }
         }
     }
-    let body = String::from_utf8_lossy(&body_bytes).into_owned();
     let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
 
-    let mut outcome = match test_string.filter(|needle| !needle.is_empty()) {
+    let mut outcome = match needle {
         Some(needle) => {
+            let body = String::from_utf8_lossy(
+                body_bytes
+                    .as_deref()
+                    .expect("body_bytes is Some whenever needle is Some"),
+            );
             let matched = body.contains(needle);
             let matched_str = if matched { "matched" } else { "not matched" };
             if status.is_success() && matched {
