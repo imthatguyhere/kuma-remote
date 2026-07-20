@@ -9,6 +9,7 @@ slow_download_mode: false #=-- optional, defaults to false; false = update downl
 http_user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36" #=-- optional, defaults to the desktop-Chrome-on-Windows string shown here; sent on every request (push, update check, web check). A generic string (e.g. reqwest's own default) may get blocked by WAFs like Cloudflare bot protection
 http_connect_timeout: 7s #=-- optional, defaults to 7s; max time to establish a connection (GitHub, Kuma, or a checked site). Does not bound the release-asset download itself, which uses its own timeout (see slow_download_mode)
 http_timeout: 30s #=-- optional, defaults to 30s; max time for the whole request/response cycle. Does not bound the release-asset download itself, which uses its own timeout (see slow_download_mode)
+web_max_response_size: 26214400 #=-- optional, defaults to 26214400 (25 MiB); max response body size, in bytes, a web check will buffer into memory before reporting Down
 
 checks:
   - id: self
