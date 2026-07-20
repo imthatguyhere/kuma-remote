@@ -1,11 +1,19 @@
 //! Web check: sends a single GET request to `url` and classifies the
 //! result.
 //!
-//! When `test_string` is set, the body is always read and checked for it —
-//! even on a non-2xx status, since the response still has a body worth
-//! checking — but `Up` requires both a 2xx status and the match; either one
-//! failing is `Down`, with the reason naming both the status and whether
-//! the string matched.
+//! When `test_string` is set (and non-empty), the body is always read and
+//! checked for it — even on a non-2xx status, since the response still has a
+//! body worth checking — but `Up` requires both a 2xx status and the match;
+//! either one failing is `Down`, with the reason naming both the status and
+//! whether the string matched. An empty `test_string` is treated the same as
+//! it being unset, rather than trivially matching every response.
+//!
+//! The body is streamed in chunks rather than read in one shot so
+//! `max_response_size` can be enforced against it (both `Content-Length`
+//! up front, and actual bytes received as they arrive) — a monitored `url`
+//! is operator-configured and may point anywhere, so an unexpectedly large
+//! or unbounded response is reported `Down` instead of being buffered into
+//! memory without limit.
 //!
 //! `latency_ms` always covers the whole page load (through the full body
 //! download, not just headers) and reflects only the request that actually
@@ -58,26 +66,31 @@ fn is_certificate_error(err: &reqwest::Error) -> bool {
 /// Request `url` once via `strict_client`, falling back to `lenient_client`
 /// on a certificate failure, and classify the result:
 ///
-/// - If `test_string` is `Some`, the body is always read and checked,
-///   regardless of status. The check is `Up` iff the status is 2xx *and*
-///   the body contains it; otherwise `Down`. Either way the message/reason
-///   names both the status and whether it matched (e.g. `200 ("Welcome"
-///   matched)` on `Up`, `404 ("Welcome" matched)` or `200 ("Welcome" not
-///   matched)` on `Down`).
-/// - If `test_string` is `None`, the check is `Up` iff the response status
-///   is 2xx; otherwise `Down` with the status code as the reason. The body
-///   is still fully read either way, so `latency_ms` reflects the whole
+/// - If `test_string` is `Some` and non-empty, the body is always read and
+///   checked, regardless of status. The check is `Up` iff the status is 2xx
+///   *and* the body contains it; otherwise `Down`. Either way the
+///   message/reason names both the status and whether it matched (e.g.
+///   `200 ("Welcome" matched)` on `Up`, `404 ("Welcome" matched)` or
+///   `200 ("Welcome" not matched)` on `Down`).
+/// - If `test_string` is `None` or empty, the check is `Up` iff the response
+///   status is 2xx; otherwise `Down` with the status code as the reason. The
+///   body is still fully read either way, so `latency_ms` reflects the whole
 ///   page load rather than just time-to-first-byte.
+///
+/// Either way, the body is read in chunks and the check reports `Down` if
+/// `max_response_size` bytes is exceeded (checked against `Content-Length`
+/// up front when present, and against bytes actually received either way).
 pub async fn check_once(
     strict_client: &Client,
     lenient_client: &Client,
     check_id: &str,
     url: &str,
     test_string: Option<&str>,
+    max_response_size: u64,
 ) -> Result<WebOutcome> {
     let mut start = Instant::now();
 
-    let response = match strict_client.get(url).send().await {
+    let mut response = match strict_client.get(url).send().await {
         Ok(response) => response,
         Err(strict_err) if is_certificate_error(&strict_err) => {
             //=-- Only the retry's own duration counts as latency -- the
@@ -111,21 +124,46 @@ pub async fn check_once(
 
     let status = response.status();
 
+    if let Some(total) = response.content_length()
+        && total > max_response_size
+    {
+        return Ok(WebOutcome::Down {
+            reason: format!(
+                "Response declared {total} bytes, exceeding the {max_response_size}-byte limit"
+            ),
+        });
+    }
+
     //=-- Always drain the body so latency_ms reflects the whole page load,
     //=-- not just time-to-first-byte -- and so a mid-download failure is
     //=-- reported the same way as every other failure path here: Down with
-    //=-- the error attached, not a hard error.
-    let body = match response.text().await {
-        Ok(body) => body,
-        Err(err) => {
+    //=-- the error attached, not a hard error. Streamed chunk-by-chunk (rather
+    //=-- than `.text()`) so max_response_size is also enforced against bytes
+    //=-- actually received, in case Content-Length was absent or wrong.
+    let mut body_bytes = Vec::new();
+    loop {
+        let chunk = match response.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(err) => {
+                return Ok(WebOutcome::Down {
+                    reason: format!("Reading response body: {err}"),
+                });
+            }
+        };
+        body_bytes.extend_from_slice(&chunk);
+        if body_bytes.len() as u64 > max_response_size {
             return Ok(WebOutcome::Down {
-                reason: format!("Reading response body: {err}"),
+                reason: format!(
+                    "Response body exceeded the {max_response_size}-byte limit while reading"
+                ),
             });
         }
-    };
+    }
+    let body = String::from_utf8_lossy(&body_bytes).into_owned();
     let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
 
-    match test_string {
+    match test_string.filter(|needle| !needle.is_empty()) {
         Some(needle) => {
             let matched = body.contains(needle);
             let matched_str = if matched { "matched" } else { "not matched" };
