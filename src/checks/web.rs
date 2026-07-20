@@ -42,9 +42,13 @@ pub enum WebOutcome {
     /// Request succeeded and the response passed its up/down test (2xx
     /// status, plus a body match when `test_string` is set).
     /// `message` is the status code, plus whether `test_string` matched
-    /// when one was configured, e.g. `200 ("Welcome" matched)`.
+    /// when one was configured, e.g. `200 ("Welcome" matched)`, plus a
+    /// trailing `[response truncated to N bytes]` note when the body
+    /// exceeded `max_response_size`.
     Up { latency_ms: f64, message: String },
     /// Request failed outright, or the response failed its up/down test.
+    /// `reason` gets the same trailing truncation note as `Up`'s `message`
+    /// when applicable.
     Down { reason: String },
 }
 
@@ -82,7 +86,10 @@ fn is_certificate_error(err: &reqwest::Error) -> bool {
 /// Either way, the body is read in chunks up to `max_response_size` bytes; a
 /// longer response is truncated to that many bytes (logging a warning) and
 /// evaluation proceeds against the truncated body, rather than reporting
-/// `Down` purely because the response was large.
+/// `Down` purely because the response was large. When truncated, a trailing
+/// `[response truncated to N bytes]` note is appended to the message/reason
+/// either way (`Up` or `Down`), so a match against a possibly-incomplete
+/// body is visible in Kuma itself, not just this process's own logs.
 pub async fn check_once(
     strict_client: &Client,
     lenient_client: &Client,
@@ -134,6 +141,7 @@ pub async fn check_once(
     //=-- known at this point regardless, so a check with no test_string
     //=-- doesn't need the (possibly truncated) body at all.
     let mut body_bytes = Vec::new();
+    let mut truncated = false;
     loop {
         match response.chunk().await {
             Ok(Some(chunk)) => {
@@ -143,6 +151,7 @@ pub async fn check_once(
                     //=-- cap -- a body of exactly max_response_size bytes with
                     //=-- nothing after it is a complete read, not a truncation.
                     body_bytes.truncate(max_response_size as usize);
+                    truncated = true;
                     warn!(
                         check_id = %check_id,
                         url = %url,
@@ -165,32 +174,47 @@ pub async fn check_once(
     let body = String::from_utf8_lossy(&body_bytes).into_owned();
     let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
 
-    match test_string.filter(|needle| !needle.is_empty()) {
+    let mut outcome = match test_string.filter(|needle| !needle.is_empty()) {
         Some(needle) => {
             let matched = body.contains(needle);
             let matched_str = if matched { "matched" } else { "not matched" };
             if status.is_success() && matched {
-                Ok(WebOutcome::Up {
+                WebOutcome::Up {
                     latency_ms,
                     message: format!("{status} (\"{needle}\" {matched_str})"),
-                })
+                }
             } else {
-                Ok(WebOutcome::Down {
+                WebOutcome::Down {
                     reason: format!("{status} (\"{needle}\" {matched_str})"),
-                })
+                }
             }
         }
         None => {
             if status.is_success() {
-                Ok(WebOutcome::Up {
+                WebOutcome::Up {
                     latency_ms,
                     message: format!("{status}"),
-                })
+                }
             } else {
-                Ok(WebOutcome::Down {
+                WebOutcome::Down {
                     reason: format!("HTTP {status}"),
-                })
+                }
             }
         }
+    };
+
+    //=-- Surfaced to Kuma either way (Up or Down) -- a match against a
+    //=-- truncated body is still worth flagging, since a test_string beyond
+    //=-- the cap would never be seen, and an operator watching Kuma has no
+    //=-- other visibility into this (the warn! above only reaches this
+    //=-- process's own logs).
+    if truncated {
+        let note = format!(" [response truncated to {max_response_size} bytes]");
+        match &mut outcome {
+            WebOutcome::Up { message, .. } => message.push_str(&note),
+            WebOutcome::Down { reason } => reason.push_str(&note),
+        }
     }
+
+    Ok(outcome)
 }
