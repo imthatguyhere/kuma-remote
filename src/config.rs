@@ -142,7 +142,11 @@ pub struct CheckConfig {
     pub host: Option<String>,
     /// Full Uptime Kuma push URL, without a query string.
     pub push_url: String,
-    /// URL to request. Required for `Web`; unused otherwise.
+    /// URL to request. Required (non-empty) for `Web`; unused otherwise. If
+    /// it has no `scheme://` prefix (e.g. a bare `example.com`), a warning
+    /// is logged and `https://` is prepended by `Config::normalize` --
+    /// `reqwest` otherwise rejects a schemeless URL outright with a
+    /// `builder error` instead of sending a request at all.
     #[serde(default)]
     pub url: Option<String>,
     /// Substring to search for in the response body. Only meaningful for
@@ -188,7 +192,11 @@ impl Config {
     }
 
     /// Fix up known copy-paste mistakes that have one unambiguous correct
-    /// interpretation, rather than forcing the user to hand-edit the file.
+    /// interpretation, rather than forcing the user to hand-edit the file:
+    /// a `push_url` with Kuma's example query string still attached, a
+    /// schemeless `url` (assumed `https`), and a `test_string` set on a
+    /// non-`web` check (warned about, not corrected, since there's no
+    /// single obviously-intended fix).
     fn normalize(&mut self) {
         for check in &mut self.checks {
             if let Some(query_start) = check.push_url.find('?') {
@@ -201,17 +209,40 @@ impl Config {
                 );
                 check.push_url.truncate(query_start);
             }
+            if check.test_string.is_some() && check.mode != CheckMode::Web {
+                warn!(
+                    check_id = %check.id,
+                    mode = ?check.mode,
+                    "test_string is set but mode is not web -- test_string is only \
+                     used by mode web and will be ignored"
+                );
+            }
+            if let Some(url) = check
+                .url
+                .as_mut()
+                .filter(|url| !url.is_empty() && !url.contains("://"))
+            {
+                warn!(
+                    check_id = %check.id,
+                    url = %url,
+                    "url has no scheme -- assuming https and prepending it"
+                );
+                *url = format!("https://{url}");
+            }
         }
     }
 
     /// Reject configs that are empty, have duplicate check ids, a
     /// zero-length interval (which would spin the scheduler tick forever), a
     /// zero `http_connect_timeout`/`http_timeout` (which would time out
-    /// every connection/request instantly), or an `instance_lock_port` of
-    /// `0` while the lock is actually in effect (port `0` always binds to a
-    /// fresh OS-assigned port, so it can never detect a duplicate instance —
-    /// silently defeating the lock instead of just weakening it, so this is
-    /// a hard error rather than a warning).
+    /// every connection/request instantly), an empty `http_user_agent`
+    /// (which would send an empty User-Agent header, defeating the reason
+    /// it's configurable in the first place), a `web` check with an empty
+    /// or missing `url`, or an `instance_lock_port` of `0` while the lock is
+    /// actually in effect (port `0` always binds to a fresh OS-assigned
+    /// port, so it can never detect a duplicate instance — silently
+    /// defeating the lock instead of just weakening it, so this is a hard
+    /// error rather than a warning).
     fn validate(&self) -> Result<()> {
         if self.checks.is_empty() {
             bail!("Config has no checks defined");
@@ -229,6 +260,12 @@ impl Config {
         if self.http_timeout.is_zero() {
             bail!("http_timeout is zero, which would time out every request instantly");
         }
+        if self.http_user_agent.is_empty() {
+            bail!(
+                "http_user_agent is empty, which sends an empty User-Agent header on every \
+                 request -- the exact generic-client signature the default value exists to avoid"
+            );
+        }
         let mut seen_ids = HashSet::new();
         for check in &self.checks {
             if !seen_ids.insert(check.id.as_str()) {
@@ -240,8 +277,11 @@ impl Config {
             if check.mode == CheckMode::Ping && check.host.is_none() {
                 bail!("Check {} uses mode ping, which requires a host", check.id);
             }
-            if check.mode == CheckMode::Web && check.url.is_none() {
-                bail!("Check {} uses mode web, which requires a url", check.id);
+            if check.mode == CheckMode::Web && check.url.as_deref().unwrap_or("").is_empty() {
+                bail!(
+                    "Check {} uses mode web, which requires a non-empty url",
+                    check.id
+                );
             }
         }
         Ok(())
