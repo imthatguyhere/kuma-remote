@@ -1,0 +1,241 @@
+//! Web check: sends a single GET request to `url` and classifies the
+//! result.
+//!
+//! When `test_string` is set (and non-empty), the body is always read and
+//! checked for it — even on a non-2xx status, since the response still has a
+//! body worth checking — but `Up` requires both a 2xx status and the match;
+//! either one failing is `Down`, with the reason naming both the status and
+//! whether the string matched. An empty `test_string` is treated the same as
+//! it being unset, rather than trivially matching every response.
+//!
+//! The body is streamed in chunks rather than read in one shot and capped at
+//! `max_response_size` — a monitored `url` is operator-configured and may
+//! point anywhere, so an unexpectedly large or unbounded response is
+//! truncated to that many bytes (with a warning logged) instead of being
+//! buffered into memory without limit. The cap exists to bound memory use,
+//! not to judge the check: the status code is already known regardless, and
+//! evaluation proceeds against whatever of the body was read, rather than
+//! reporting `Down` on size alone.
+//!
+//! `latency_ms` covers the whole read (through the full body download, or up
+//! to the point of truncation, not just headers) and reflects only the
+//! request that actually answered: a failed `strict_client` attempt's time
+//! is never folded into a successful `lenient_client` retry's latency.
+//!
+//! For an `https` `url`, a request that fails with a certificate error is
+//! retried once through `lenient_client` (which accepts invalid
+//! certificates). If that retry succeeds, the check still proceeds as
+//! reachable — a monitor shouldn't flip to `Down` purely because a cert
+//! expired if the service itself is still answering — but a warning is
+//! logged so the bad certificate doesn't go unnoticed. Any other kind of
+//! request failure (DNS, connection refused, timeout, ...) is reported
+//! `Down` directly, without retrying.
+
+use std::time::Instant;
+
+use anyhow::Result;
+use reqwest::Client;
+use tracing::warn;
+
+/// Outcome of running a single web check.
+pub enum WebOutcome {
+    /// Request succeeded and the response passed its up/down test (2xx
+    /// status, plus a body match when `test_string` is set).
+    /// `message` is the status code, plus whether `test_string` matched
+    /// when one was configured, e.g. `200 ("Welcome" matched)`, plus a
+    /// trailing `[response truncated to N bytes]` note when the body
+    /// exceeded `max_response_size`.
+    Up { latency_ms: f64, message: String },
+    /// Request failed outright, or the response failed its up/down test.
+    /// `reason` gets the same trailing truncation note as `Up`'s `message`
+    /// when applicable.
+    Down { reason: String },
+}
+
+/// True if `err` (or anything in its `source()` chain) looks like a TLS
+/// certificate failure rather than some other connection problem. reqwest
+/// has no dedicated certificate-error variant, so this matches on the
+/// underlying TLS backend's error text -- the same fallback any caller of a
+/// generic HTTP client has to use to tell a bad cert apart from, say, a
+/// refused connection or a DNS failure.
+fn is_certificate_error(err: &reqwest::Error) -> bool {
+    let mut source: Option<&dyn std::error::Error> = Some(err);
+    while let Some(err) = source {
+        if err.to_string().to_lowercase().contains("certificate") {
+            return true;
+        }
+        source = err.source();
+    }
+    false
+}
+
+/// Request `url` once via `strict_client`, falling back to `lenient_client`
+/// on a certificate failure, and classify the result:
+///
+/// - If `test_string` is `Some` and non-empty, the body is always read and
+///   checked, regardless of status. The check is `Up` iff the status is 2xx
+///   *and* the body contains it; otherwise `Down`. Either way the
+///   message/reason names both the status and whether it matched (e.g.
+///   `200 ("Welcome" matched)` on `Up`, `404 ("Welcome" matched)` or
+///   `200 ("Welcome" not matched)` on `Down`).
+/// - If `test_string` is `None` or empty, the check is `Up` iff the response
+///   status is 2xx; otherwise `Down` with the status code as the reason. The
+///   body is still fully read either way, so `latency_ms` reflects the whole
+///   page load rather than just time-to-first-byte.
+///
+/// Either way, the body is read in chunks up to `max_response_size` bytes; a
+/// longer response is truncated to that many bytes (logging a warning) and
+/// evaluation proceeds against the truncated body, rather than reporting
+/// `Down` purely because the response was large. When truncated, a trailing
+/// `[response truncated to N bytes]` note is appended to the message/reason
+/// either way (`Up` or `Down`), so a match against a possibly-incomplete
+/// body is visible in Kuma itself, not just this process's own logs.
+pub async fn check_once(
+    strict_client: &Client,
+    lenient_client: &Client,
+    check_id: &str,
+    url: &str,
+    test_string: Option<&str>,
+    max_response_size: u64,
+) -> Result<WebOutcome> {
+    let mut start = Instant::now();
+
+    let mut response = match strict_client.get(url).send().await {
+        Ok(response) => response,
+        Err(strict_err) if is_certificate_error(&strict_err) => {
+            //=-- Only the retry's own duration counts as latency -- the
+            //=-- failed strict attempt's time is not this check's load time.
+            start = Instant::now();
+            match lenient_client.get(url).send().await {
+                Ok(response) => {
+                    warn!(
+                        check_id = %check_id,
+                        url = %url,
+                        error = %strict_err,
+                        "HTTPS request only succeeded with certificate validation \
+                         disabled -- server is presenting an invalid, expired, or \
+                         self-signed certificate"
+                    );
+                    response
+                }
+                Err(lenient_err) => {
+                    return Ok(WebOutcome::Down {
+                        reason: format!("Request failed: {lenient_err}"),
+                    });
+                }
+            }
+        }
+        Err(err) => {
+            return Ok(WebOutcome::Down {
+                reason: format!("Request failed: {err}"),
+            });
+        }
+    };
+
+    let status = response.status();
+
+    //=-- Streamed chunk-by-chunk (rather than `.text()`) and capped at
+    //=-- max_response_size -- the cap exists to bound memory use, not to
+    //=-- judge the check, so an oversized body is truncated for evaluation
+    //=-- rather than reported Down on size alone. The status code is already
+    //=-- known at this point regardless, so a check with no test_string
+    //=-- doesn't need the (possibly truncated) body at all -- only the byte
+    //=-- count (for the truncation check) and the read itself (for latency).
+    let needle = test_string.filter(|needle| !needle.is_empty());
+    //=-- usize::try_from + saturating fallback -- on a target where usize is
+    //=-- narrower than u64, `max_response_size as usize` would silently wrap
+    //=-- (e.g. a configured 4 GiB cap becoming 0) instead of clamping to the
+    //=-- largest length actually representable.
+    let max_len = usize::try_from(max_response_size).unwrap_or(usize::MAX);
+    let mut body_bytes: Option<Vec<u8>> = if needle.is_some() {
+        Some(Vec::new())
+    } else {
+        None
+    };
+    let mut bytes_read: u64 = 0;
+    let mut truncated = false;
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                bytes_read += chunk.len() as u64;
+                if let Some(body_bytes) = &mut body_bytes {
+                    body_bytes.extend_from_slice(&chunk);
+                }
+                if bytes_read > max_response_size {
+                    //=-- Only truly truncated once a chunk pushes us past the
+                    //=-- cap -- a body of exactly max_response_size bytes with
+                    //=-- nothing after it is a complete read, not a truncation.
+                    if let Some(body_bytes) = &mut body_bytes {
+                        body_bytes.truncate(max_len);
+                    }
+                    truncated = true;
+                    warn!(
+                        check_id = %check_id,
+                        url = %url,
+                        max_response_size,
+                        "Response body exceeded max_response_size -- truncating for \
+                         status/test_string evaluation instead of failing the check on \
+                         size alone"
+                    );
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(err) => {
+                return Ok(WebOutcome::Down {
+                    reason: format!("Reading response body: {err}"),
+                });
+            }
+        }
+    }
+    let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+    let mut outcome = match needle {
+        Some(needle) => {
+            let body = String::from_utf8_lossy(
+                body_bytes
+                    .as_deref()
+                    .expect("body_bytes is Some whenever needle is Some"),
+            );
+            let matched = body.contains(needle);
+            let matched_str = if matched { "matched" } else { "not matched" };
+            if status.is_success() && matched {
+                WebOutcome::Up {
+                    latency_ms,
+                    message: format!("{status} (\"{needle}\" {matched_str})"),
+                }
+            } else {
+                WebOutcome::Down {
+                    reason: format!("{status} (\"{needle}\" {matched_str})"),
+                }
+            }
+        }
+        None => {
+            if status.is_success() {
+                WebOutcome::Up {
+                    latency_ms,
+                    message: format!("{status}"),
+                }
+            } else {
+                WebOutcome::Down {
+                    reason: format!("HTTP {status}"),
+                }
+            }
+        }
+    };
+
+    //=-- Surfaced to Kuma either way (Up or Down) -- a match against a
+    //=-- truncated body is still worth flagging, since a test_string beyond
+    //=-- the cap would never be seen, and an operator watching Kuma has no
+    //=-- other visibility into this (the warn! above only reaches this
+    //=-- process's own logs).
+    if truncated {
+        let note = format!(" [response truncated to {max_response_size} bytes]");
+        match &mut outcome {
+            WebOutcome::Up { message, .. } => message.push_str(&note),
+            WebOutcome::Down { reason } => reason.push_str(&note),
+        }
+    }
+
+    Ok(outcome)
+}

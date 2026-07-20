@@ -14,7 +14,7 @@ It runs as a long-lived daemon: each configured check runs independently on its 
 - Rust 1.94 or later (edition 2024) to build from source.
 - Network access from the machine running `kuma-remote` to both the checked hosts and the Uptime Kuma push URL.
 - No administrator/root privileges are required. On Windows, pings use the native `IcmpSendEcho` API; on Linux/macOS, the OS `ping` binary is invoked directly (no raw-socket capability needed).
-- If the push URL sits behind a reverse proxy or WAF, note that `kuma-remote` sends push requests with a desktop-Chrome-on-Windows `User-Agent` header (not a generic HTTP-client string) specifically to avoid bot-protection false positives; adjust any allowlists accordingly if you rely on user-agent filtering.
+- If the push URL sits behind a reverse proxy or WAF, note that `kuma-remote` sends push requests with a desktop-Chrome-on-Windows `User-Agent` header by default (not a generic HTTP-client string) specifically to avoid bot-protection false positives; adjust any allowlists accordingly if you rely on user-agent filtering, or override `http_user_agent` in the config.
 - Unless `auto_update: false` is set, the machine also needs outbound HTTPS access to `api.github.com` and `github.com` (release asset downloads), and the process needs write access to its own install directory so it can replace its executable.
 
 ## Building
@@ -37,6 +37,10 @@ service_mode: false #=-- optional, defaults to false; true = defer restart-on-up
 instance_lock: true #=-- optional, defaults to true; ignored when service_mode is true. Set false to disable the single-instance guard
 instance_lock_port: 51247 #=-- optional, defaults to 51247; loopback port used only as a single-instance mutex, change if it collides with something else on the host. Must be non-zero when the lock is in effect (instance_lock: true and service_mode: false) — 0 is rejected at startup
 slow_download_mode: false #=-- optional, defaults to false; false = update download capped at 5 minutes total; true = no total cap, only aborts after a full minute with no data (a genuine stall)
+http_user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36" #=-- optional, defaults to a desktop-Chrome-on-Windows string
+http_connect_timeout: 7s #=-- optional, defaults to 7s
+http_timeout: 30s #=-- optional, defaults to 30s
+web_max_response_size: 26214400 #=-- optional, defaults to 26214400 (25 MiB)
 
 checks:
   - id: self
@@ -59,6 +63,14 @@ checks:
     host: db.internal.local
     push_url: "https://kuma.mydomain.com/api/push/QwErTy987"
     interval: 5m
+
+  - id: site01
+    name: "Marketing Site"
+    mode: web
+    url: "https://example.com" #=-- required for web
+    test_string: "Welcome" #=-- optional
+    push_url: "https://kuma.mydomain.com/api/push/WebSite1"
+    interval: 60s
 ```
 
 Top-level fields:
@@ -70,18 +82,24 @@ Top-level fields:
 - `instance_lock` — optional, defaults to `true`. Ignored when `service_mode` is `true`. See [Auto-Update](#auto-update) below.
 - `instance_lock_port` — optional, defaults to `51247`. See [Auto-Update](#auto-update) below.
 - `slow_download_mode` — optional, defaults to `false`. See [Auto-Update](#auto-update) below.
+- `http_user_agent` — optional, defaults to a desktop-Chrome-on-Windows `User-Agent` string. Sent on every HTTP request `kuma-remote` makes (push, update check/download, `web` check). Override this if your reverse proxy/WAF filters on user agent and expects something else. Rejected at startup if empty.
+- `http_connect_timeout` — optional, defaults to `7s`. Max time to establish a connection for any of the above requests, as a duration string. Does not bound the release-asset download itself (see [Auto-Update](#auto-update)). Rejected at startup if zero.
+- `http_timeout` — optional, defaults to `30s`. Max time for the whole request/response cycle for any of the above requests, as a duration string. Does not bound the release-asset download itself (see [Auto-Update](#auto-update)). Rejected at startup if zero.
+- `web_max_response_size` — optional, defaults to `26214400` (25 MiB). Max response body size, in bytes, that a `web` check will buffer into memory. A larger response is truncated to this many bytes (with a warning logged) and evaluated as-is, rather than reporting the check `down`; the cap bounds memory use, not the outcome. Rejected at startup if zero.
 - `checks` — the list of checks to run, described below.
 
 Fields, per entry under `checks`:
 
 - `id` — Required. Unique slug for this check. Duplicate ids are a startup error.
 - `name` — Required. Human-readable name, used only in logs.
-- `mode` — Required. Check strategy: `ping` or `heartbeat` (see Check Modes below).
-- `host` — IP address or hostname to check. Required for `ping`. Optional for `heartbeat`: when set, it's also pinged and a successful latency is included in the push; a missing host, or a failed/timed-out ping, doesn't affect the heartbeat's `Up` status.
+- `mode` — Required. Check strategy: `ping`, `heartbeat`, or `web` (see Check Modes below).
+- `host` — IP address or hostname to check. Required for `ping`. Optional for `heartbeat`: when set, it's also pinged and a successful latency is included in the push; a missing host, or a failed/timed-out ping, doesn't affect the heartbeat's `Up` status. Unused for `web`.
+- `url` — URL to request. Required for `web` (rejected at startup if missing, empty, or whitespace-only); unused otherwise. If it doesn't parse as an absolute URL (e.g. a bare `example.com` with no scheme), `https://` is prepended automatically and a warning is logged — a schemeless URL would otherwise fail every run with `Request failed: builder error` rather than actually being requested.
+- `test_string` — Optional, only meaningful for `web`. A substring to search for in the response body. When set to a non-empty value, the body is always read and checked for it, even on a non-2xx response — but the check only reports up when the status is also 2xx; either the status or the match failing reports down, with the reason naming both. When unset or empty, the check instead reports down on any non-2xx status code, the same as if `test_string` weren't configured at all. Setting it on a `ping`/`heartbeat` check is not an error, but logs a startup warning, since it's simply ignored there.
 - `push_url` — Required. Full Uptime Kuma push URL for this monitor. Kuma's dashboard displays the push URL with a `?status=up&msg=OK&ping=` example suffix attached for you to copy as a curl command; `kuma-remote` builds its own `status`/`msg`/`ping` query string, so if `push_url` still has a `?...` suffix on load, it's stripped automatically and logged as a warning rather than rejected.
 - `interval` — Required. How often to run the check, as a duration string (`30s`, `5m`, `1h`, ...).
 
-The config file must define at least one check; a zero-length `interval`, a duplicate `id`, or a `ping` check missing `host` is rejected at startup.
+The config file must define at least one check; a zero-length `interval`, a duplicate `id`, an empty `http_user_agent`, a zero `web_max_response_size`, a `ping` check missing `host`, or a `web` check with a missing, empty, or whitespace-only `url` is rejected at startup.
 
 ### Environment variables
 
@@ -117,7 +135,7 @@ flowchart TD
   C -- "No" --> F{"Single-instance lock active?"}
   F -- "Yes" --> G["claim_single_instance"]
   G -- "Already running" --> E
-  G -- "Claimed or unavailable" --> H["Build HTTP client"]
+  G -- "Claimed or unavailable" --> H["Build HTTP clients (strict + lenient)"]
   F -- "No" --> H
   H --> I{"auto_update?"}
   I -- "Yes" --> J["updater::check_and_update"]
@@ -153,6 +171,7 @@ Any failure in this process — no network access, GitHub rate limiting, no matc
 - `scheduler.rs` — Per-check interval loop; dispatches to the check's mode and pushes the result.
 - `checks/ping.rs` — Ping check: single ICMP echo per run, cross-platform via the `pinger` crate.
 - `checks/heartbeat.rs` — Heartbeat check: always reports up, optionally pinging `host` for latency.
+- `checks/web.rs` — Web check: single GET request to `url`, reports up/down from the response.
 - `kuma.rs` — Uptime Kuma push client (builds the `status`/`msg`/`ping` query string, sends the GET request).
 - `logging.rs` — `tracing` subscriber setup.
 - `updater.rs` — checks GitHub's latest release for a newer build, self-replaces and restarts when found, guards against duplicate instances via a single-instance TCP lock with an identity handshake, and serves `--stop` requests on that same port.
@@ -162,6 +181,12 @@ Any failure in this process — no network access, GitHub rate limiting, no matc
 - `ping` — Sends a single ICMP echo to `host` and reports latency (up) or the failure reason (down). `host` is required.
 - `heartbeat` — Always reports up with message "Heartbeat", signaling the `kuma-remote` process itself is alive rather than testing reachability.
   - `host` is optional; if set, it's also pinged once and a successful latency is included, but a failed or missing ping never turns the heartbeat down.
+- `web` — Sends a single GET request to `url` (required, non-empty) and reports up (with latency) or down (with a reason) based on the response. The response body is always read to completion (even when `test_string` is unset), so the reported latency covers the whole page load, not just time-to-first-byte.
+  - If `test_string` is set to a non-empty value, the (already-read) response body is checked for it, even when the status isn't 2xx. Up requires both a 2xx status and the match; the message/reason always names both, e.g. `200 ("Welcome" matched)` on up, `404 ("Welcome" matched)` or `200 ("Welcome" not matched)` on down.
+  - If `test_string` is unset or empty, up/down depends only on the HTTP status code (2xx is up). On up, the message is just the status code, e.g. `200`; on down, the reason is the status code itself.
+  - A request that fails with a TLS certificate error (e.g. an expired, self-signed, or otherwise untrusted certificate on an `https://` `url`, including one reached only after a redirect) is retried once with certificate validation disabled. If that retry succeeds, the check still proceeds as reachable (evaluated per the rules above) rather than reporting down purely because of the bad certificate, but a warning noting the invalid/expired/self-signed certificate is logged either way, and only the retry's own duration counts toward the reported latency. Any other kind of failure (unreachable host, DNS failure, timeout, ...) is reported down directly, without a retry.
+  - The body is read in chunks rather than in one shot and capped at `web_max_response_size`: a response exceeding that size is truncated to it (with a warning logged) rather than being buffered into memory without limit, and the check is still evaluated (status code, and `test_string` match against the truncated body) rather than reported down purely for being large. Either way (up or down), the pushed message/reason gets a trailing `[response truncated to N bytes]` note when this happened, so a match against a possibly-incomplete body is visible in Kuma itself, not just this process's own logs.
+  - If the body itself fails to fully download after a successful response (e.g. the connection drops mid-transfer), the check reports down with the error, the same as any other failure -- it never crashes the check run.
 
 ## License
 

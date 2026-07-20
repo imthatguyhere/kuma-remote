@@ -4,20 +4,20 @@ name = "kuma-remote"
 description = "Uptime Kuma push monitor client"
 authors = ["Imthatguyhere (ITGH | Tyler)"]
 repository = "https://github.com/imthatguyhere/kuma-remote"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 
 [dependencies]
-anyhow = "1.0.103"
-clap = { version = "4.6.2", features = ["derive"] }
+anyhow = "1.0.104"
+clap = { version = "4.6.3", features = ["derive"] }
 humantime-serde = "1.1.1"
 pinger = "2.1.4"
 reqwest = { version = "0.13.4", features = ["query", "json"] }
 self-replace = "1.5.0"
-serde = { version = "1.0.228", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
 sha2 = "0.11.0"
 strict-yaml-rust = { version = "0.2.0", features = ["serde"] }
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time", "process", "signal", "fs"] }
+tokio = { version = "1.53.0", features = ["rt-multi-thread", "macros", "time", "process", "signal", "fs"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 

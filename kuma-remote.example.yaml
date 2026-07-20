@@ -6,24 +6,37 @@ instance_lock: true #=-- optional, defaults to true; ignored when service_mode i
 instance_lock_port: 51247 #=-- optional, defaults to 51247; loopback port used only as a single-instance mutex, change if it collides with something else on the host. Must be non-zero when the lock is in effect (instance_lock: true and service_mode: false) — 0 is rejected at startup
 slow_download_mode: false #=-- optional, defaults to false; false = update download is capped at 5 minutes total even if still progressing; true = no total cap, only aborts after a full minute with no data at all (a genuine stall). Turn on for slow/unreliable links
 
+http_user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36" #=-- optional, defaults to the desktop-Chrome-on-Windows string shown here; sent on every request (push, update check, web check). A generic string (e.g. reqwest's own default) may get blocked by WAFs like Cloudflare bot protection
+http_connect_timeout: 7s #=-- optional, defaults to 7s; max time to establish a connection (GitHub, Kuma, or a checked site). Does not bound the release-asset download itself, which uses its own timeout (see slow_download_mode)
+http_timeout: 30s #=-- optional, defaults to 30s; max time for the whole request/response cycle. Does not bound the release-asset download itself, which uses its own timeout (see slow_download_mode)
+web_max_response_size: 26214400 #=-- optional, defaults to 26214400 (25 MiB); max response body size, in bytes, a web check will buffer into memory before reporting Down
+
 checks:
   - id: self
     name: "Remote Agent Heartbeat"
     mode: heartbeat #=-- always reports Up with msg "Heartbeat"; host is optional
     host: 8.8.8.8 #=-- optional — if set, also pings and includes latency, good for pinging 8.8.8.8 — or similar — for internet latency
     push_url: "https://kuma.mydomain.com/api/push/HbEaT456"
-    interval: 60s #=-- It's recommended to set the heartbeat interval to at least 30 seconds longer than the longest expected check interval
+    interval: 60s #=-- It's recommended to set the push monitor's heartbeat interval to at least 30 seconds longer than the longest expected check interval
     
   - id: web01
     name: "Prod Web Server"
     mode: ping
     host: 192.168.1.10
     push_url: "https://kuma.mydomain.com/api/push/AbC123XyZ"
-    interval: 60s #=-- It's recommended to set the heartbeat interval to at least 30 seconds longer than the longest expected check interval
+    interval: 60s #=-- It's recommended to set the push monitor's heartbeat interval to at least 30 seconds longer than the longest expected check interval
 
   - id: db01
     name: "Database Host"
     mode: ping
     host: db.internal.local
     push_url: "https://kuma.mydomain.com/api/push/QwErTy987"
-    interval: 5m #=-- It's recommended to set the heartbeat interval to at least 30 seconds longer than the longest expected check interval
+    interval: 5m #=-- It's recommended to set the push monitor's heartbeat interval to at least 30 seconds longer than the longest expected check interval
+
+  - id: site01
+    name: "Example Web Site"
+    mode: web
+    url: "https://example.com" #=-- required for web; the URL requested. A bad/expired/self-signed https certificate is warned about in logs but does not fail the check on its own
+    test_string: "Welcome" #=-- optional; if set, the body is always checked for this string even on a non-2xx response, but up requires both a 2xx status and the match. If unset, up requires only a 2xx status code
+    push_url: "https://kuma.mydomain.com/api/push/WebSite1"
+    interval: 60s #=-- It's recommended to set the push monitor's heartbeat interval to at least 30 seconds longer than the longest expected check interval

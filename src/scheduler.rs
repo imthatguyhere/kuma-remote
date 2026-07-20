@@ -6,29 +6,45 @@ use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval};
 use tracing::{error, info, warn};
 
-use crate::checks::{heartbeat, ping};
+use crate::checks::{heartbeat, ping, web};
 use crate::config::{CheckConfig, CheckMode};
 use crate::kuma::{self, PushStatus};
+
+/// The HTTP clients shared by every check task. `client` is used for every
+/// check mode; `lenient_client` is only read by `Web` checks, as a fallback
+/// when an `https` `url` fails certificate validation under `client` (see
+/// `checks/web.rs`). Bundled into one struct (rather than threaded as
+/// separate parameters) so a future mode-specific client is one new field
+/// here, not a new parameter through every function below.
+#[derive(Clone)]
+pub struct HttpClients {
+    pub client: Client,
+    pub lenient_client: Client,
+}
 
 /// Spawn one background task per check; returns their join handles so the
 /// caller can abort them on shutdown. `debug` enables logging the exact
 /// pushed URL (including query string) on every push. `report_run_failures`
 /// controls whether a run error (as opposed to a completed `Down` result)
 /// is also pushed to Kuma as `down`, per [`crate::config::Config::report_run_failures`].
+/// `max_response_size` is only read by `Web` checks; see
+/// [`crate::config::Config::web_max_response_size`].
 pub fn spawn_all(
     checks: Vec<CheckConfig>,
-    client: Client,
+    clients: HttpClients,
     debug: bool,
     report_run_failures: bool,
+    max_response_size: u64,
 ) -> Vec<JoinHandle<()>> {
     checks
         .into_iter()
         .map(|check| {
             tokio::spawn(run_check_loop(
                 check,
-                client.clone(),
+                clients.clone(),
                 debug,
                 report_run_failures,
+                max_response_size,
             ))
         })
         .collect()
@@ -41,22 +57,25 @@ pub fn spawn_all(
 /// loop.
 async fn run_check_loop(
     check: CheckConfig,
-    client: Client,
+    clients: HttpClients,
     debug: bool,
     report_run_failures: bool,
+    max_response_size: u64,
 ) {
     let mut ticker = interval(check.interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
         ticker.tick().await;
-        if let Err(err) = run_once(&check, &client, debug).await {
+        if let Err(err) = run_once(&check, &clients, debug, max_response_size).await {
             error!(check_id = %check.id, error = %err, "Check run failed");
             if report_run_failures {
                 let status = PushStatus::Down {
                     message: format!("Check run failed: {err}"),
                 };
-                if let Err(push_err) = kuma::push(&client, &check.push_url, status, debug).await {
+                if let Err(push_err) =
+                    kuma::push(&clients.client, &check.push_url, status, debug).await
+                {
                     error!(check_id = %check.id, error = %push_err, "Failed to push run-failure status");
                 }
             }
@@ -65,8 +84,14 @@ async fn run_check_loop(
 }
 
 /// Run `check` once per its configured `mode`, log the outcome, and push
-/// the resulting status to Kuma.
-async fn run_once(check: &CheckConfig, client: &Client, debug: bool) -> anyhow::Result<()> {
+/// the resulting status to Kuma. `max_response_size` is only read by `Web`
+/// checks.
+async fn run_once(
+    check: &CheckConfig,
+    clients: &HttpClients,
+    debug: bool,
+    max_response_size: u64,
+) -> anyhow::Result<()> {
     let status = match check.mode {
         CheckMode::Ping => {
             let host = check
@@ -97,7 +122,38 @@ async fn run_once(check: &CheckConfig, client: &Client, debug: bool) -> anyhow::
                 message: Some("Heartbeat".to_string()),
             }
         }
+        CheckMode::Web => {
+            let url = check
+                .url
+                .as_deref()
+                .expect("Config::validate requires a url for mode web");
+            match web::check_once(
+                &clients.client,
+                &clients.lenient_client,
+                &check.id,
+                url,
+                check.test_string.as_deref(),
+                max_response_size,
+            )
+            .await?
+            {
+                web::WebOutcome::Up {
+                    latency_ms,
+                    message,
+                } => {
+                    info!(check_id = %check.id, name = %check.name, latency_ms, message = %message, "Up");
+                    PushStatus::Up {
+                        ping_ms: Some(latency_ms),
+                        message: Some(message),
+                    }
+                }
+                web::WebOutcome::Down { reason } => {
+                    warn!(check_id = %check.id, name = %check.name, reason = %reason, "Down");
+                    PushStatus::Down { message: reason }
+                }
+            }
+        }
     };
 
-    kuma::push(client, &check.push_url, status, debug).await
+    kuma::push(&clients.client, &check.push_url, status, debug).await
 }

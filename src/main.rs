@@ -10,7 +10,6 @@ mod scheduler;
 mod updater;
 
 use std::path::PathBuf;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -50,6 +49,29 @@ fn resolve_config_path(explicit: Option<PathBuf>) -> PathBuf {
         .map(PathBuf::from)
         .find(|path| path.exists())
         .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_CANDIDATES[0]))
+}
+
+/// Builds one of the two shared `reqwest::Client`s: the strict `client`
+/// used everywhere, or (when `lenient` is set) the `lenient_client` used
+/// only as a `web` check's certificate-failure fallback (see
+/// `checks/web.rs`). Both share the same user agent and timeouts; `lenient`
+/// is the only thing that differs between them.
+fn build_http_client(config: &config::Config, lenient: bool) -> Result<reqwest::Client> {
+    let builder = reqwest::Client::builder()
+        .user_agent(config.http_user_agent.clone())
+        .connect_timeout(config.http_connect_timeout)
+        .timeout(config.http_timeout);
+    let builder = if lenient {
+        builder.danger_accept_invalid_certs(true)
+    } else {
+        builder
+    };
+    builder.build().with_context(|| {
+        format!(
+            "Building {} HTTP client",
+            if lenient { "lenient" } else { "strict" }
+        )
+    })
 }
 
 /// Entry point: log the app name/version/authors, load config. If `--stop`
@@ -127,6 +149,8 @@ async fn main() -> Result<()> {
                 name = %check.name,
                 mode = ?check.mode,
                 host = ?check.host,
+                url = ?check.url,
+                test_string = ?check.test_string,
                 push_url = %check.push_url,
                 interval = ?check.interval,
                 "Debug: check configured"
@@ -143,15 +167,16 @@ async fn main() -> Result<()> {
     //=-- request/response cycle for everything except the release-asset
     //=-- download, which overrides it (see `updater.rs`) since that response
     //=-- can legitimately take longer than a small API/push response would.
-    let client = reqwest::Client::builder()
-        .user_agent(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
-             (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        )
-        .connect_timeout(Duration::from_secs(7))
-        .timeout(Duration::from_secs(30))
-        .build()
-        .context("Building HTTP client")?;
+    //=-- All three are configurable (`http_user_agent`/`http_connect_timeout`/
+    //=-- `http_timeout`) since a strict WAF/proxy or a slow link may need
+    //=-- different values than the defaults below.
+    let client = build_http_client(&config, false)?;
+
+    //=-- Used only as a fallback by `web` checks, when an `https` `url`
+    //=-- fails certificate validation under the strict `client` above --
+    //=-- so a monitor doesn't flip to Down purely because a cert expired,
+    //=-- as long as the server is still answering (see `checks/web.rs`).
+    let lenient_client = build_http_client(&config, true)?;
 
     if config.auto_update {
         let outcome = updater::check_and_update(
@@ -173,9 +198,13 @@ async fn main() -> Result<()> {
 
     let handles = scheduler::spawn_all(
         config.checks,
-        client,
+        scheduler::HttpClients {
+            client,
+            lenient_client,
+        },
         config.debug,
         config.report_run_failures,
+        config.web_max_response_size,
     );
 
     //=-- Races Ctrl-C against a `--stop` request (see `updater.rs`) when the
